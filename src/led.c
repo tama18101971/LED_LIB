@@ -131,7 +131,7 @@ static led_effect_t cur_effect = LED_EFFECT_NONE;
  * Если > 0 — декрементируется в led_process(), при достижении 0
  * вызывается led_stop_effect().
  */
-static uint16_t effect_remaining = 0;
+static uint32_t effect_remaining = 0;
 
 /**
  * Глобальный счётчик тиков.
@@ -446,10 +446,10 @@ static void eff_running_circle(uint32_t tick, bool st[LED_COUNT])
 static void eff_pair_blink(uint32_t tick, bool st[LED_COUNT])
 {
     bool on = ((tick / 15) % 2 == 0);
-    st[0] = on;
-    st[1] = !on;
-    st[2] = on;
-    st[3] = !on;
+    uint8_t i;
+    for (i = 0; i < LED_COUNT; i++) {
+        st[i] = (i % 2 == 0) ? on : !on;
+    }
 }
 
 /**
@@ -557,10 +557,64 @@ static void eff_triple_blink(uint32_t tick, bool st[LED_COUNT])
 static void eff_alternating(uint32_t tick, bool st[LED_COUNT])
 {
     bool on = ((tick / 20) % 2 == 0);
-    st[0] = on;
-    st[1] = !on;
-    st[2] = on;
-    st[3] = !on;
+    uint8_t i;
+    for (i = 0; i < LED_COUNT; i++) {
+        st[i] = (i % 2 == 0) ? on : !on;
+    }
+}
+
+/**
+ * Бегущий огонь вперёд + пауза + удержание последнего (LED3) 0.75 сек.
+ *
+ * Фазы:
+ *   0-39:   бегущий огонь 0→1→2→3 (10 тиков/позиция)
+ *   40-59:  пауза (все выключены)
+ *   60-104: LED3 горит 45 тиков (0.75 сек)
+ *   Период: 105 тиков
+ */
+static void eff_running_fwd_hold(uint32_t tick, bool st[LED_COUNT])
+{
+    uint8_t pos;
+    uint8_t i;
+    uint32_t phase = tick % 105;
+
+    for (i = 0; i < LED_COUNT; i++) st[i] = false;
+
+    if (phase < 40) {
+        pos = (uint8_t)(phase / 10);
+        if (pos < LED_COUNT) {
+            st[pos] = true;
+        }
+    } else if (phase >= 60) {
+        st[LED_COUNT - 1] = true;
+    }
+}
+
+/**
+ * Бегущий огонь назад + пауза + удержание первого (LED0) 0.75 сек.
+ *
+ * Фазы:
+ *   0-39:   бегущий огонь 3→2→1→0 (10 тиков/позиция)
+ *   40-59:  пауза (все выключены)
+ *   60-104: LED0 горит 45 тиков (0.75 сек)
+ *   Период: 105 тиков
+ */
+static void eff_running_bwd_hold(uint32_t tick, bool st[LED_COUNT])
+{
+    uint8_t pos;
+    uint8_t i;
+    uint32_t phase = tick % 105;
+
+    for (i = 0; i < LED_COUNT; i++) st[i] = false;
+
+    if (phase < 40) {
+        pos = (uint8_t)(phase / 10);
+        if (pos < LED_COUNT) {
+            st[LED_COUNT - 1 - pos] = true;
+        }
+    } else if (phase >= 60) {
+        st[0] = true;
+    }
 }
 
 /* ================================================================== */
@@ -592,17 +646,19 @@ typedef void (*eff_fn)(uint32_t, bool[LED_COUNT]);
  *   4) В таблицу добавить: [LED_EFFECT_MY_NEW] = eff_my_new,
  */
 static const eff_fn eff_table[LED_EFFECT_COUNT] = {
-    [LED_EFFECT_NONE]           = (void *)0,
-    [LED_EFFECT_RUNNING_FWD]    = eff_running_fwd,
-    [LED_EFFECT_RUNNING_BWD]    = eff_running_bwd,
-    [LED_EFFECT_RUNNING_PP]     = eff_running_pp,
-    [LED_EFFECT_RUNNING_CIRCLE] = eff_running_circle,
-    [LED_EFFECT_PAIR_BLINK]     = eff_pair_blink,
-    [LED_EFFECT_EMERGENCY]      = eff_emergency,
-    [LED_EFFECT_RANDOM_FLASH]   = eff_random_flash,
-    [LED_EFFECT_DOUBLE_BLINK]   = eff_double_blink,
-    [LED_EFFECT_TRIPLE_BLINK]   = eff_triple_blink,
-    [LED_EFFECT_ALTERNATING]    = eff_alternating
+    [LED_EFFECT_NONE]             = (void *)0,
+    [LED_EFFECT_RUNNING_FWD]      = eff_running_fwd,
+    [LED_EFFECT_RUNNING_BWD]      = eff_running_bwd,
+    [LED_EFFECT_RUNNING_PP]       = eff_running_pp,
+    [LED_EFFECT_RUNNING_CIRCLE]   = eff_running_circle,
+    [LED_EFFECT_PAIR_BLINK]       = eff_pair_blink,
+    [LED_EFFECT_EMERGENCY]        = eff_emergency,
+    [LED_EFFECT_RANDOM_FLASH]     = eff_random_flash,
+    [LED_EFFECT_DOUBLE_BLINK]     = eff_double_blink,
+    [LED_EFFECT_TRIPLE_BLINK]     = eff_triple_blink,
+    [LED_EFFECT_ALTERNATING]      = eff_alternating,
+    [LED_EFFECT_RUNNING_FWD_HOLD] = eff_running_fwd_hold,
+    [LED_EFFECT_RUNNING_BWD_HOLD] = eff_running_bwd_hold
 };
 
 /**
@@ -612,17 +668,19 @@ static const eff_fn eff_table[LED_EFFECT_COUNT] = {
  * RANDOM_FLASH не имеет цикла — период = 1 (repeats = ticks).
  */
 static const uint16_t eff_period[LED_EFFECT_COUNT] = {
-    [LED_EFFECT_NONE]           = 0,
-    [LED_EFFECT_RUNNING_FWD]    = 40,   /* 4 позиции × 10 тиков  */
-    [LED_EFFECT_RUNNING_BWD]    = 40,
-    [LED_EFFECT_RUNNING_PP]     = 60,   /* 6 позиций × 10 тиков  */
-    [LED_EFFECT_RUNNING_CIRCLE] = 32,   /* 4 позиции × 8 тиков   */
-    [LED_EFFECT_PAIR_BLINK]     = 30,   /* 2 фазы × 15 тиков     */
-    [LED_EFFECT_EMERGENCY]      = 10,   /* 2 фазы × 5 тиков      */
-    [LED_EFFECT_RANDOM_FLASH]   = 1,    /* нет цикла */
-    [LED_EFFECT_DOUBLE_BLINK]   = 80,   /* 16 фаз × 5 тиков      */
-    [LED_EFFECT_TRIPLE_BLINK]   = 105,  /* 21 фаза × 5 тиков     */
-    [LED_EFFECT_ALTERNATING]    = 40    /* 2 фазы × 20 тиков     */
+    [LED_EFFECT_NONE]             = 0,
+    [LED_EFFECT_RUNNING_FWD]      = 40,   /* 4 позиции × 10 тиков  */
+    [LED_EFFECT_RUNNING_BWD]      = 40,
+    [LED_EFFECT_RUNNING_PP]       = 60,   /* 6 позиций × 10 тиков  */
+    [LED_EFFECT_RUNNING_CIRCLE]   = 32,   /* 4 позиции × 8 тиков   */
+    [LED_EFFECT_PAIR_BLINK]       = 30,   /* 2 фазы × 15 тиков     */
+    [LED_EFFECT_EMERGENCY]        = 10,   /* 2 фазы × 5 тиков      */
+    [LED_EFFECT_RANDOM_FLASH]     = 1,    /* нет цикла */
+    [LED_EFFECT_DOUBLE_BLINK]     = 80,   /* 16 фаз × 5 тиков      */
+    [LED_EFFECT_TRIPLE_BLINK]     = 105,  /* 21 фаза × 5 тиков     */
+    [LED_EFFECT_ALTERNATING]      = 40,   /* 2 фазы × 20 тиков     */
+    [LED_EFFECT_RUNNING_FWD_HOLD] = 105,  /* 40 + 20 пауза + 45 удержание */
+    [LED_EFFECT_RUNNING_BWD_HOLD] = 105
 };
 
 /* ================================================================== */
@@ -652,9 +710,10 @@ void led_init(void)
     }
 
     /* Сброс глобальных переменных */
-    hw_set     = (void *)0;
-    cur_effect = LED_EFFECT_NONE;
-    g_tick     = 0;
+    hw_set           = (void *)0;
+    cur_effect       = LED_EFFECT_NONE;
+    effect_remaining = 0;
+    g_tick           = 0;
 }
 
 void led_set_callback(led_set_fn fn)
@@ -682,9 +741,6 @@ void led_process(void)
     uint8_t i;
     bool effect_st[LED_COUNT];  /* Буфер для состояний эффекта */
     bool any_effect = false;
-
-    /* Глобальный счётчик тиков */
-    g_tick++;
 
     /* Шаг 1: обработка каждого LED в его ручном режиме */
     for (i = 0; i < LED_COUNT; i++) {
@@ -739,6 +795,9 @@ void led_process(void)
             }
         }
     }
+
+    /* Инкремент счётчика тиков после рендеринга (первый тик = 0) */
+    g_tick++;
 }
 
 /* ================================================================== */
@@ -851,7 +910,7 @@ void led_blink(uint8_t id, uint16_t on_ticks, uint16_t off_ticks)
  */
 void led_play(uint8_t id, const led_sequence_t *seq)
 {
-    if (id >= LED_COUNT || !seq || seq->count == 0) return;
+    if (id >= LED_COUNT || !seq || !seq->steps || seq->count == 0) return;
 
     /* Установить режим SEQUENCE */
     leds[id].mode      = LED_MODE_SEQUENCE;
@@ -889,7 +948,14 @@ void led_start_effect(led_effect_t effect)
     uint8_t i;
     if (effect >= LED_EFFECT_COUNT) return;
 
-    cur_effect = effect;
+    if (effect == LED_EFFECT_NONE) {
+        led_stop_effect();
+        return;
+    }
+
+    cur_effect       = effect;
+    effect_remaining = 0;
+    g_tick           = 0;
     for (i = 0; i < LED_COUNT; i++) {
         if (leds[i].mode != LED_MODE_EFFECT) {
             leds[i].mode = LED_MODE_EFFECT;
@@ -901,7 +967,7 @@ void led_start_effect_for(led_effect_t effect, uint16_t repeats)
 {
     led_start_effect(effect);
     if (effect < LED_EFFECT_COUNT) {
-        effect_remaining = repeats * eff_period[effect];
+        effect_remaining = (uint32_t)repeats * eff_period[effect];
     }
 }
 
@@ -924,6 +990,25 @@ void led_stop_effect(void)
     effect_remaining = 0;
 }
 
+uint8_t led_effect_is_running(void)
+{
+    return effect_remaining > 0 ? 1 : 0;
+}
+
+uint8_t led_any_led_active(void)
+{
+    uint8_t i;
+    for (i = 0; i < LED_COUNT; i++) {
+        if (leds[i].mode == LED_MODE_ON_FOR ||
+            leds[i].mode == LED_MODE_BLINK ||
+            leds[i].mode == LED_MODE_SEQUENCE ||
+            leds[i].mode == LED_MODE_EFFECT) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void led_flash_and_fade(uint8_t count)
 {
     uint8_t i;
@@ -931,6 +1016,11 @@ void led_flash_and_fade(uint8_t count)
 
     /* Остановить текущий эффект, если есть */
     led_stop_effect();
+
+    /* Выключить неиспользуемые диоды */
+    for (i = count; i < LED_COUNT; i++) {
+        set_mode_off(i);
+    }
 
     /*
      * Включить count диодов одновременно, затем погасить по одному.
@@ -950,7 +1040,7 @@ void led_flash_and_fade(uint8_t count)
      *   tick 90:     LED0 гаснет
      */
     for (i = 0; i < count; i++) {
-        uint16_t on_time = 120 + (count - 1 - i) * 10;
+        uint16_t on_time = 60 + (count - 1 - i) * 10;
         led_on_for(i, on_time);
     }
 }

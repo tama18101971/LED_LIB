@@ -30,8 +30,9 @@
 - Включение на заданное время (auto-off)
 - Непрерывное мигание
 - Воспроизведение пользовательских последовательностей (SOS, двойное мигание и т.д.)
-- 10 встроенных глобальных эффектов (бегущий огонь, аварийная сигнализация и т.д.)
+- 12 встроенных глобальных эффектов (бегущий огонь, аварийная сигнализация, удержание и т.д.)
 - Эффект на N повторов с авто-остановкой (`led_start_effect_for`)
+- Запрос состояния эффектов и диодов (`led_effect_is_running`, `led_any_led_active`)
 - Вспышка с последовательным погасанием (`led_flash_and_fade`)
 - Расширяемость: новые эффекты добавляются без изменения кода библиотеки
 
@@ -262,7 +263,7 @@ void led_flash_and_fade(uint8_t count);
 
 Вспышка `count` диодов с последовательным погасанием.
 
-Включает диоды 0..count-1 одновременно, ждёт 2 секунды (120 тиков),
+Включает диоды 0..count-1 одновременно, ждёт 1 секунду (60 тиков),
 затем гасит по одному с интервалом ~167 мс (10 тиков), начиная с последнего.
 
 | Параметр | Описание |
@@ -270,7 +271,7 @@ void led_flash_and_fade(uint8_t count);
 | `count` | Количество диодов (1..LED_COUNT) |
 
 ```c
-led_flash_and_fade(4);  // все 4 вспыхивают → 2 сек → гаснут по одному
+led_flash_and_fade(4);  // все 4 вспыхивают → 1 сек → гаснут по одному
 led_flash_and_fade(2);  // LED0+LED1 вспыхивают → гаснут
 led_flash_and_fade(1);  // только LED0
 ```
@@ -528,6 +529,8 @@ led_mode_t led_get_mode(uint8_t id);
 | `LED_EFFECT_DOUBLE_BLINK` | Двойное мигание | Паттерн |
 | `LED_EFFECT_TRIPLE_BLINK` | Тройное мигание | Паттерн |
 | `LED_EFFECT_ALTERNATING` | Чередование чёт/нечёт | Переключение / 333 мс |
+| `LED_EFFECT_RUNNING_FWD_HOLD` | Бегущий вперёд + пауза + 0.75с удержание | 1.75 сек/цикл |
+| `LED_EFFECT_RUNNING_BWD_HOLD` | Бегущий назад + пауза + 0.75с удержание | 1.75 сек/цикл |
 
 ### Запуск и остановка эффектов
 
@@ -569,6 +572,8 @@ void led_start_effect_for(led_effect_t effect, uint16_t repeats);
 | DOUBLE_BLINK | 80 | 1.33 сек |
 | TRIPLE_BLINK | 105 | 1.75 сек |
 | ALTERNATING | 40 | 667 мс |
+| RUNNING_FWD_HOLD | 105 | 1.75 сек |
+| RUNNING_BWD_HOLD | 105 | 1.75 сек |
 
 **Примеры:**
 ```c
@@ -589,6 +594,20 @@ led_start_effect(LED_EFFECT_RUNNING_FWD);
 ```c
 // Случайные вспышки на 60 тиков (1 секунда)
 led_start_effect_for(LED_EFFECT_RANDOM_FLASH, 60);
+```
+
+#### Проверка состояния эффектов и диодов
+
+```c
+// Проверка: выполняется ли сейчас эффект с ограничением повторов (led_start_effect_for)
+if (led_effect_is_running()) {
+    // эффект ещё активен
+}
+
+// Проверка: активен ли хотя бы один диод (ON_FOR, BLINK, SEQUENCE, EFFECT)
+if (led_any_led_active()) {
+    // идёт индикация
+}
 ```
 
 ### Добавление своего эффекта
@@ -617,8 +636,8 @@ static void eff_my_custom(uint32_t tick, bool st[LED_COUNT]) {
 ```c
 typedef enum {
     // ... существующие эффекты ...
-    LED_EFFECT_CUSTOM     = 11,  // НОВЫЙ ЭФФЕКТ
-    LED_EFFECT_COUNT      = 12   // Увеличить на 1
+    LED_EFFECT_CUSTOM     = 13,  // НОВЫЙ ЭФФЕКТ
+    LED_EFFECT_COUNT      = 14   // Увеличить на 1
 } led_effect_t;
 ```
 
@@ -682,7 +701,7 @@ led_stop_effect();
 | `led_start_effect(...)` | Все LED в EFFECT (если не "оторваны") |
 | `led_start_effect_for(..., N)` | Все LED в EFFECT на N повторов |
 | `led_stop_effect()` | LED в EFFECT → OFF |
-| `led_flash_and_fade(count)` | count LED → ON 2 сек → погасают по одному |
+| `led_flash_and_fade(count)` | count LED → ON 1 сек → погасают по одному |
 
 ### Примеры
 
@@ -896,9 +915,9 @@ void TIMER_IRQHandler(void) {
 | `leds[4]` (конечные автоматы) | 4 × 23 = 92 байта |
 | `hw_set` (указатель) | 4 байта |
 | `cur_effect` | 4 байта |
-| `effect_remaining` | 2 байта |
+| `effect_remaining` | 4 байта |
 | `g_tick` | 4 байта |
-| **Итого** | **~106 байт** |
+| **Итого** | **~108 байт** |
 
 ### Flash
 
