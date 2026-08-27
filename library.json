@@ -1,0 +1,20 @@
+{
+    "name": "LED_LIB",
+    "version": "1.0.0",
+    "description": "Bare-metal LED control library for 4 independent LEDs: per-LED state machines (on/off/on-for/blink/sequences), 10 global effects, auto-stop repeats. C99, no RTOS, no malloc, ~90 bytes RAM, GPIO via user callback.",
+    "keywords": [
+        "led",
+        "blink",
+        "bare-metal",
+        "embedded",
+        "state-machine",
+        "effects",
+        "ch32v003",
+        "stm32",
+        "avr"
+    ],
+    "platforms": "*",
+    "frameworks": "*",
+    "headers": "led.h",
+    "src_filter": "+<src/>"
+}

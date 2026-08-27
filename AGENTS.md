@@ -4,17 +4,22 @@
 
 Bare-metal LED control library for 4 independent LEDs on MCU (no RTOS). Pure C99, ~90 bytes RAM, no malloc/free.
 
-- **Library**: `led.h` + `led.c` — portable, MCU-agnostic
-- **Demo project**: `test_ch32v003/` — CH32V003F4P6 (RISC-V 48MHz, 2KB RAM, 16KB Flash) via PlatformIO + WCH NoneOS SDK
+- **Library**: `include/led.h` + `src/led.c` (+ `library.json`) — portable, MCU-agnostic. Internal state (`led_state_t`) is defined in `led.c`, not in the public header.
+- **Demo project**: `examples/test_ch32v003/` — CH32V003F4P6 (RISC-V 48MHz, 2KB RAM, 16KB Flash) via PlatformIO + WCH NoneOS SDK. Sources only: no library copies, no own `platformio.ini`.
 
 ## Build
 
 ```bash
-cd test_ch32v003
-pio run                     # build
+pio run                     # build the demo (from repo ROOT)
 pio run -t upload           # flash via WCH-Link
 pio device monitor          # serial output (115200 baud)
 ```
+
+## Layout rules
+
+- The root `platformio.ini` builds the demo: `src_dir = examples/test_ch32v003/src`, library attached via `lib_deps = symlink://.`; `library.json` has `src_filter: "+<src/>"` to prevent recursive scanning of the self-symlinked dependency.
+- Never copy `led.c`/`led.h` into `examples/` — the demo must always compile the root library.
+- `include/` is the public API surface; internal types (e.g. `led_state_t`) live in `src/led.c`.
 
 ## Hardware pins
 
