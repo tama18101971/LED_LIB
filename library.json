@@ -1,6 +1,6 @@
 {
     "name": "led-lib",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Bare-metal LED control library for 4 independent LEDs: per-LED state machines (off/on/on-for/blink/sequences), 12 global effects, auto-stop repeats. C99, no RTOS, no malloc, ~97 bytes RAM for library state, GPIO only via user callback.",
     "keywords": [
         "led",

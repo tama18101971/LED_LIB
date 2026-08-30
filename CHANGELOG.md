@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-30
+
+### Fixed
+- README minimal example: `led_start_effect_for()` must come BEFORE per-LED
+  calls (`led_blink`, `led_on_for`) — the effect claims all non-EFFECT LEDs,
+  and per-LED calls after it "detach" the specific LEDs. Clarified that the
+  API never blocks; `led_process()` drives the state machines.
+- Demo: use the corrected effect-then-per-LED example in `main.c`
+  (LED2+LED3 emergency flashes, LED0 blink, LED1 on-for 5 s).
+
 ## [1.0.0] - 2026-08-30
 
 ### Added
