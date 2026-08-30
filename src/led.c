@@ -32,6 +32,8 @@
  *    - eff_running_fwd_hold — fwd_hold/bwd_hold (общая)
  *    - eff_random_flash    — псевдослучайный генератор (xorshift32)
  *
+ *    Эффекты возвращают БИТОВУЮ МАСКУ (бит i = LED i включён), а не
+ *    массив bool — компактнее и быстрее на RV32.
  *    Все эффекты продвигают инкрементные счётчики (fx_*), поэтому
  *    не вызывают программное деление/умножение (__udivsi3/__mulsi3),
  *
@@ -44,14 +46,14 @@
  *  ПОТРЕБЛЕНИЕ RAM
  * =====================================================================
  *
- *   leds[4]:           4 × 20 = 80 байт
+ *   leds[4]:           4 × 20 = 80 байт  (mode и флаги упакованы в 2 байта)
  *   hw_set:            4 байта (указатель на RV32/ARM)
- *   cur_effect:        1 байт
+ *   cur_effect:        4 байта (enum = int)
  *   effect_remaining:  4 байта
  *   out_mask:          1 байт
  *   driven_mask:       1 байт
  *   fx_*:              3 байта
- *   Итого:             ~94 байта (около 90)
+ *   Итого:             ~97 байт (около 90)
  *
  * =====================================================================
  *  ВРЕМЯ ВЫПОЛНЕНИЯ led_process()
@@ -70,6 +72,7 @@
  */
 
 #include "led.h"
+#include <string.h>
 
 /* ================================================================== */
 /*  СОСТОЯНИЕ ОДНОГО СВЕТОДИОДА (внутренний тип, перенесён из led.h)    */
@@ -81,39 +84,44 @@
  * Поля разбиты на группы по назначению:
  *
  * 1) mode — текущий режим (определяет, какой обработчик вызывать)
+ *    Хранится как uint8_t: enum led_mode_t в публичном API остаётся
+ *    int, но внутри достаточно одного байта.
  *
  * 2) Счётчики для режимов ON_FOR и BLINK:
  *    - counter   — оставшееся количество тиков в текущей фазе
  *    - on_ticks  — длительность ON-фазы (только для BLINK)
  *    - off_ticks — длительность OFF-фазы (только для BLINK)
- *    - phase     — true = сейчас ON-фаза, false = OFF-фаза (BLINK)
  *
  * 3) Воспроизведение последовательности (SEQUENCE):
  *    - seq       — указатель на массив шагов (из led_sequence_t)
  *    - seq_len   — общее количество шагов
  *    - seq_idx   — индекс текущего шага
  *    - seq_cnt   — оставшееся время текущего шага
- *    - seq_phase — состояние текущего шага (ON/OFF)
- *    - seq_loop  — зациклена ли последовательность
  *
- * Итого: 20 байт на LED × 4 = 80 байт + глобальные ~10 байт ≈ 90 байт.
+ * 4) Один байт flags с битовыми флагами:
+ *    - LED_F_PHASE     — true = сейчас ON-фаза (BLINK)
+ *    - LED_F_SEQ_PHASE — состояние текущего шага ON/OFF (SEQUENCE)
+ *    - LED_F_SEQ_LOOP  — зациклена ли последовательность
+ *
+ * Поля расставлены так, чтобы минимизировать выравнивание:
+ * указатель идёт первым (нужно выравнивание 4), все uint16_t следом.
+ * Итого 20 байт на LED (было 24 из-за enum-int mode и разрозненных
+ * bool) × 4 = 80 байт.
  */
+#define LED_F_PHASE     0x01  /**< BLINK: сейчас ON-фаза */
+#define LED_F_SEQ_PHASE 0x02  /**< SEQUENCE: состояние текущего шага */
+#define LED_F_SEQ_LOOP  0x04  /**< SEQUENCE: зациклена */
+
 typedef struct {
-    led_mode_t mode;
-
-    /* Счётчики для ON_FOR / BLINK */
-    uint16_t counter;
-    uint16_t on_ticks;
-    uint16_t off_ticks;
-    bool     phase;
-
-    /* Воспроизведение последовательности */
-    const led_step_t *seq;
-    uint16_t          seq_len;
-    uint16_t          seq_idx;
-    uint16_t          seq_cnt;
-    bool              seq_phase;
-    bool              seq_loop;
+    const led_step_t *seq;   /* 0..3   */
+    uint16_t          counter;    /* 4..5   */
+    uint16_t          on_ticks;   /* 6..7   */
+    uint16_t          off_ticks;  /* 8..9   */
+    uint16_t          seq_len;    /* 10..11 */
+    uint16_t          seq_idx;    /* 12..13 */
+    uint16_t          seq_cnt;    /* 14..15 */
+    uint8_t           mode;       /* 16     */
+    uint8_t           flags;      /* 17     */
 } led_state_t;
 
 /* ================================================================== */
@@ -296,9 +304,12 @@ static void process_on(uint8_t id)
  * Обработчик режима ON_FOR — включён на заданное число тиков.
  *
  * Логика:
- *   1. Если counter > 0: включить диод, декремент counter.
- *   2. Если counter стал 0: переключить режим в OFF, выключить диод.
- *   3. Если counter == 0 (сразу): выключить диод.
+ *   1. counter > 0: включить диод, декремент counter.
+ *   2. counter стал 0: переключить режим в OFF, выключить диод.
+ *
+ * Ветка counter == 0 на входе недостижима: led_on_for() с ticks == 0
+ * сразу переводит диод в OFF, а обнуление счётчика здесь тут же
+ * переключает режим — следующий тик обрабатывается как OFF.
  *
  * Пример: led_on_for(1, 300) при 60 Гц → диод горит 5 секунд.
  *
@@ -306,14 +317,14 @@ static void process_on(uint8_t id)
  */
 static void process_on_for(uint8_t id)
 {
-    if (leds[id].counter > 0) {
-        apply_state(id, true);
-        leds[id].counter--;
-        if (leds[id].counter == 0) {
-            leds[id].mode = LED_MODE_OFF;
-            apply_state(id, false);
-        }
-    } else {
+    /* counter гарантированно > 0: led_on_for() с ticks == 0 сразу
+     * переводит диод в OFF, а обнуление счётчика ниже тут же меняет
+     * режим — следующий тик обрабатывается как OFF. Ветка counter == 0
+     * на входе недостижима и была удалена. */
+    apply_state(id, true);
+    leds[id].counter--;
+    if (leds[id].counter == 0) {
+        leds[id].mode = LED_MODE_OFF;
         apply_state(id, false);
     }
 }
@@ -346,7 +357,7 @@ static void process_blink(uint8_t id)
 {
     led_state_t *s = &leds[id];
 
-    if (s->phase) {
+    if (s->flags & LED_F_PHASE) {
         /* ON-фаза: диод включён, считаем время до выключения */
         apply_state(id, true);
         if (s->counter > 0) {
@@ -355,7 +366,7 @@ static void process_blink(uint8_t id)
         if (s->counter == 0) {
             /* Переход в OFF-фазу */
             s->counter = s->off_ticks;
-            s->phase   = false;
+            s->flags  &= (uint8_t)~LED_F_PHASE;
         }
     } else {
         /* OFF-фаза: диод выключен, считаем время до включения */
@@ -366,7 +377,7 @@ static void process_blink(uint8_t id)
         if (s->counter == 0) {
             /* Переход в ON-фазу */
             s->counter = s->on_ticks;
-            s->phase   = true;
+            s->flags  |= LED_F_PHASE;
         }
     }
 }
@@ -403,7 +414,7 @@ static void process_sequence(uint8_t id)
     led_state_t *s = &leds[id];
 
     /* Применить состояние текущего шага */
-    apply_state(id, s->seq_phase);
+    apply_state(id, (s->flags & LED_F_SEQ_PHASE) != 0);
 
     /* Декремент счётчика текущего шага */
     if (s->seq_cnt > 0) {
@@ -416,7 +427,7 @@ static void process_sequence(uint8_t id)
 
         /* Проверка на конец последовательности */
         if (s->seq_idx >= s->seq_len) {
-            if (s->seq_loop) {
+            if (s->flags & LED_F_SEQ_LOOP) {
                 s->seq_idx = 0;       /* Зациклить: начать сначала */
             } else {
                 s->mode = LED_MODE_OFF;
@@ -426,9 +437,11 @@ static void process_sequence(uint8_t id)
         }
 
         /* Загрузить параметры нового шага */
-        s->seq_phase = s->seq[s->seq_idx].state;
-        s->seq_cnt   = s->seq[s->seq_idx].ticks;
-        apply_state(id, s->seq_phase);
+        s->flags  = (uint8_t)((s->flags & (uint8_t)~LED_F_SEQ_PHASE) |
+                              (s->seq[s->seq_idx].state
+                                   ? LED_F_SEQ_PHASE : 0));
+        s->seq_cnt = s->seq[s->seq_idx].ticks;
+        apply_state(id, (s->flags & LED_F_SEQ_PHASE) != 0);
     }
 }
 
@@ -462,18 +475,14 @@ static uint8_t fx_adv(uint8_t v, uint8_t max)
  * Направление и период выбираются по текущему эффекту (cur_effect).
  * Позиция продвигается инкрементом — без деления глобального тика.
  *
- * @param st    Выходной массив состояний [LED_COUNT].
+ * @return Битовая маска: бит i = LED i включён.
  */
-static void eff_running_fwd(bool st[LED_COUNT])
+static uint8_t eff_running_fwd(void)
 {
     bool bwd = (cur_effect == LED_EFFECT_RUNNING_BWD);
     uint8_t period = (cur_effect == LED_EFFECT_RUNNING_CIRCLE) ? 8 : 10;
     uint8_t pos = bwd ? (uint8_t)(LED_COUNT - 1 - fx_pos) : fx_pos;
-    uint8_t i;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == pos);
-    }
     fx_cnt = fx_adv(fx_cnt, period);
     if (fx_cnt == 0) {
         /* Позиция всегда продвигается ВПЕРЁД; для bwd направление
@@ -482,6 +491,7 @@ static void eff_running_fwd(bool st[LED_COUNT])
          * разворот и последовательность 3,0,1,2... вместо 3,2,1,0... */
         fx_pos = fx_adv(fx_pos, LED_COUNT);
     }
+    return (uint8_t)(1u << pos);
 }
 
 /**
@@ -491,15 +501,10 @@ static void eff_running_fwd(bool st[LED_COUNT])
  * Направление хранится в fx_phase: 0 = вперёд, 1 = назад.
  * Требует LED_COUNT >= 2.
  */
-static void eff_running_pp(bool st[LED_COUNT])
+static uint8_t eff_running_pp(void)
 {
-    uint8_t i;
-
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == fx_pos);
-    }
     fx_cnt = fx_adv(fx_cnt, 10);
-    if (fx_cnt != 0) return;
+    if (fx_cnt != 0) return (uint8_t)(1u << fx_pos);
 
     if (fx_phase == 0) {
         if (fx_pos + 1 >= LED_COUNT) {
@@ -516,6 +521,7 @@ static void eff_running_pp(bool st[LED_COUNT])
             fx_pos--;
         }
     }
+    return (uint8_t)(1u << fx_pos);
 }
 
 /**
@@ -533,9 +539,8 @@ static void eff_running_pp(bool st[LED_COUNT])
  * (cur_effect) — одно копирование кода вместо трёх функций.
  * Фаза хранится в fx_phase (0 = чётные горят / все включены).
  */
-static void eff_emergency(bool st[LED_COUNT])
+static uint8_t eff_emergency(void)
 {
-    uint8_t i;
     bool on = (fx_phase == 0);
     bool all = (cur_effect == LED_EFFECT_EMERGENCY);
     uint8_t period;
@@ -548,14 +553,14 @@ static void eff_emergency(bool st[LED_COUNT])
         period = 15;
     }
 
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = all ? on : (((i & 1) == 0) ? on : !on);
-    }
-
     fx_cnt = fx_adv(fx_cnt, period);
     if (fx_cnt == 0) {
         fx_phase ^= 1;
     }
+
+    /* 00001111 — все 4; биты чётных/нечётных — для противофазы */
+    return (uint8_t)(all ? (on ? 0x0F : 0x00)
+                         : (on ? 0x05 : 0x0A));
 }
 
 /**
@@ -567,10 +572,9 @@ static void eff_emergency(bool st[LED_COUNT])
  *
  * Начальное seed: 0xDEADBEEF (может быть любым != 0).
  */
-static void eff_random_flash(bool st[LED_COUNT])
+static uint8_t eff_random_flash(void)
 {
     static uint32_t rng = 0xDEADBEEF;
-    uint8_t i;
 
     /* xorshift32: 3 XOR-сдвига дают максимальный период 2^32 - 1 */
     rng ^= rng << 13;
@@ -578,9 +582,7 @@ static void eff_random_flash(bool st[LED_COUNT])
     rng ^= rng << 5;
 
     /* Младшие 4 бита — состояние 4 диодов */
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = ((rng >> i) & 1) != 0;
-    }
+    return (uint8_t)(rng & 0x0F);
 }
 
 /**
@@ -595,11 +597,10 @@ static void eff_random_flash(bool st[LED_COUNT])
  *
  * Делитель: 5 тиков на фазу.
  */
-static void eff_double_blink(bool st[LED_COUNT])
+static uint8_t eff_double_blink(void)
 {
     bool triple = (cur_effect == LED_EFFECT_TRIPLE_BLINK);
     bool on;
-    uint8_t i;
 
     if (triple) {
         /* ON на фазах 0,1,4,5,8,9; OFF на остальных */
@@ -609,14 +610,12 @@ static void eff_double_blink(bool st[LED_COUNT])
         on = (fx_phase < 2) || (fx_phase >= 4 && fx_phase < 6);
     }
 
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = on;
-    }
-
     fx_cnt = fx_adv(fx_cnt, 5);
     if (fx_cnt == 0) {
         fx_phase = fx_adv(fx_phase, triple ? 21 : 16);
     }
+
+    return on ? (uint8_t)0x0F : (uint8_t)0x00;
 }
 
 /**
@@ -632,17 +631,16 @@ static void eff_double_blink(bool st[LED_COUNT])
  *   60-104: крайний диод горит 45 тиков (0.75 сек)
  *   Период: 105 тиков
  */
-static void eff_running_fwd_hold(bool st[LED_COUNT])
+static uint8_t eff_running_fwd_hold(void)
 {
     bool bwd = (cur_effect == LED_EFFECT_RUNNING_BWD_HOLD);
-    uint8_t i;
-
-    for (i = 0; i < LED_COUNT; i++) st[i] = false;
+    uint8_t mask = 0;
 
     if (fx_phase < 40) {
-        st[bwd ? (uint8_t)(LED_COUNT - 1 - fx_pos) : fx_pos] = true;
+        mask = (uint8_t)(1u << (bwd ? (uint8_t)(LED_COUNT - 1 - fx_pos)
+                                    : fx_pos));
     } else if (fx_phase >= 60) {
-        st[bwd ? 0 : (uint8_t)(LED_COUNT - 1)] = true;
+        mask = (uint8_t)(1u << (bwd ? 0 : (uint8_t)(LED_COUNT - 1)));
     }
 
     /* Продвижение фазы: 0..104 */
@@ -659,6 +657,8 @@ static void eff_running_fwd_hold(bool st[LED_COUNT])
         fx_cnt = 0;
         fx_pos = 0;
     }
+
+    return mask;
 }
 
 /* ================================================================== */
@@ -666,7 +666,10 @@ static void eff_running_fwd_hold(bool st[LED_COUNT])
 /* ================================================================== */
 
 /**
- * Тип функции-эффекта: записывает желаемые состояния 4 диодов.
+ * Тип функции-эффекта: возвращает битовую маску состояний 4 диодов.
+ *
+ * Бит i результата = желаемое состояние LED i (1 = включён).
+ * Это компактнее и быстрее на RV32, чем записывать массив bool[].
  *
  * Это ключ к расширяемости: чтобы добавить новый эффект, достаточно:
  *   1) Написать функцию с этой сигнатурой.
@@ -675,9 +678,9 @@ static void eff_running_fwd_hold(bool st[LED_COUNT])
  *
  * Аналогично led_process() эффекты не зависят от глобального тика:
  * фазы и позиции продвигаются инкрементными счётчиками (fx_*),
- * поэтому в функции не передаётся номер тика.
+ * поэтому в функцию не передаётся номер тика.
  */
-typedef void (*eff_fn)(bool[LED_COUNT]);
+typedef uint8_t (*eff_fn)(void);
 
 /**
  * Таблица эффектов — индексируется по enum led_effect_t.
@@ -738,25 +741,11 @@ static const uint16_t eff_period[LED_EFFECT_COUNT] = {
 
 void led_init(void)
 {
-    uint8_t i;
-
     /*
-     * Сброс всех 4 конечных автоматов в начальное состояние:
-     *   mode = OFF, все счётчики = 0, указатели = NULL.
+     * Сброс всех 4 конечных автоматов: нулевые значения дают mode = OFF
+     * (LED_MODE_OFF == 0), flags = 0 и все поля = 0.
      */
-    for (i = 0; i < LED_COUNT; i++) {
-        leds[i].mode      = LED_MODE_OFF;
-        leds[i].counter   = 0;
-        leds[i].on_ticks  = 0;
-        leds[i].off_ticks = 0;
-        leds[i].phase     = false;
-        leds[i].seq       = (void *)0;
-        leds[i].seq_len   = 0;
-        leds[i].seq_idx   = 0;
-        leds[i].seq_cnt   = 0;
-        leds[i].seq_phase = false;
-        leds[i].seq_loop  = false;
-    }
+    memset(leds, 0, sizeof(leds));
 
     /* Сброс глобальных переменных */
     hw_set           = (void *)0;
@@ -795,7 +784,7 @@ void led_set_callback(led_set_fn fn)
 void led_process(void)
 {
     uint8_t i;
-    bool effect_st[LED_COUNT];  /* Буфер для состояний эффекта */
+    uint8_t effect_mask = 0;  /* Маска состояний эффекта (бит i = LED i) */
     bool any_effect = false;
 
     /* Шаг 1: обработка каждого LED в его ручном режиме */
@@ -833,13 +822,13 @@ void led_process(void)
     if (any_effect && cur_effect != LED_EFFECT_NONE &&
         eff_table[cur_effect]) {
 
-        /* Вызвать функцию эффекта: она запишет состояния в effect_st[] */
-        eff_table[cur_effect](effect_st);
+        /* Вызвать функцию эффекта: она вернёт битовую маску состояний */
+        effect_mask = eff_table[cur_effect]();
 
         /* Применить состояния только к тем LED, которые в EFFECT-режиме */
         for (i = 0; i < LED_COUNT; i++) {
             if (leds[i].mode == LED_MODE_EFFECT) {
-                apply_state(i, effect_st[i]);
+                apply_state(i, (effect_mask & (uint8_t)(1u << i)) != 0);
             }
         }
 
@@ -934,7 +923,7 @@ void led_blink(uint8_t id, uint16_t on_ticks, uint16_t off_ticks)
     leds[id].counter   = on_ticks;
     leds[id].on_ticks  = on_ticks;
     leds[id].off_ticks = off_ticks;
-    leds[id].phase     = true;
+    leds[id].flags     = LED_F_PHASE;
     apply_state(id, true);
 }
 
@@ -971,15 +960,16 @@ void led_play(uint8_t id, const led_sequence_t *seq)
     /* Загрузить параметры последовательности */
     leds[id].seq       = seq->steps;
     leds[id].seq_len   = seq->count;
-    leds[id].seq_loop  = seq->loop;
 
     /* Начать с первого шага */
     leds[id].seq_idx   = 0;
-    leds[id].seq_phase = seq->steps[0].state;
+    leds[id].flags     = (uint8_t)((seq->loop ? LED_F_SEQ_LOOP : 0) |
+                                   (seq->steps[0].state
+                                        ? LED_F_SEQ_PHASE : 0));
     leds[id].seq_cnt   = seq->steps[0].ticks;
 
     /* Немедленно применить первое состояние */
-    apply_state(id, leds[id].seq_phase);
+    apply_state(id, (leds[id].flags & LED_F_SEQ_PHASE) != 0);
 }
 
 /* ================================================================== */
