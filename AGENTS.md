@@ -2,7 +2,7 @@
 
 ## Project
 
-Bare-metal LED control library for 4 independent LEDs on MCU (no RTOS). Pure C99, ~90 bytes RAM, no malloc/free.
+Bare-metal LED control library for 4 independent LEDs on MCU (no RTOS). Pure C99, ~97 bytes RAM for library state, no malloc/free.
 
 - **Library**: `include/led.h` + `src/led.c` (+ `library.json`) — portable, MCU-agnostic. Internal state (`led_state_t`) is defined in `led.c`, not in the public header.
 - **Demo project**: `examples/test_ch32v003/` — CH32V003F4P6 (RISC-V 48MHz, 2KB RAM, 16KB Flash) via PlatformIO + WCH NoneOS SDK. Sources only: no library copies, no own `platformio.ini`.

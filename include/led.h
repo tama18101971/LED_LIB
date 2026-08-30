@@ -1,3 +1,11 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * LED_LIB — bare-metal LED control library for 4 independent LEDs.
+ * Copyright (c) 2025-2026 tama18101971
+ * See LICENSE for the full MIT license text.
+ */
+
 /**
  * @file led.h
  * @brief Библиотека управления 4 светодиодами для bare-metal микроконтроллеров (без RTOS).

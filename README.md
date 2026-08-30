@@ -1,23 +1,39 @@
 # LED_LIB — библиотека управления 4 светодиодами
 
-Bare-metal библиотека для 4 независимых светодиодов на любом MCU (без RTOS).
-Чистый C99, ~90 байт RAM, без malloc/free. Доступ к GPIO — только через
-пользовательский callback (`led_set_fn`).
+Bare-metal библиотека для **4 независимых светодиодов** на любом MCU (без RTOS).
+Чистый C99, ~97 байт RAM на состояние библиотеки, без malloc/free.
+Доступ к GPIO — только через пользовательский callback (`led_set_fn`),
+поэтому библиотека не содержит аппаратно-зависимого кода.
 
-## Структура
+## Возможности
 
+- 4 независимых конечных автомата: `led_on`, `led_off`, `led_toggle`,
+  `led_on_for`, `led_blink`, `led_play` (произвольные последовательности, SOS и т.п.).
+- 12 встроенных глобальных эффектов (бегущий огонь, мигания, случайные вспышки…)
+  с автоповтором и автоостановкой (`led_start_effect_for`).
+- О(1) время выполнения `led_process()`, отсутствие программного деления
+  в горячем пути (эффекты используют инкрементные счётчики).
+- Кэширование записи GPIO: callback вызывается только при изменении пина.
+- Расширяемость: добавление эффекта — одна функция + запись в таблицу.
+
+## Установка
+
+**PlatformIO / PlatformIO Registry** (рекомендуется):
+
+```ini
+[env:your_board]
+lib_deps = led-lib
 ```
-LED_LIB/
-├── include/led.h           — публичный API библиотеки
-├── src/led.c               — реализация (внутреннее состояние тоже здесь)
-├── library.json            — манифест PlatformIO-библиотеки
-├── platformio.ini          — сборка демо из корня (src_dir → examples/)
-├── docs/LED_LIBRARY.md     — полная документация
-├── AGENTS.md               — соглашения проекта
-└── examples/test_ch32v003/ — демо для CH32V003F4P6 (только исходники)
+
+**Из GitHub:**
+
+```ini
+lib_deps = https://github.com/tama18101971/LED_LIB.git
 ```
 
-## Быстрый старт (демо CH32V003)
+**Вручную:** скопируйте `include/led.h` и `src/led.c` в проект.
+
+## Демо (CH32V003)
 
 ```bash
 pio run                # сборка из корня репозитория
@@ -25,8 +41,47 @@ pio run -t upload      # прошивка через WCH-Link
 pio device monitor     # монитор порта (115200)
 ```
 
-## Использование в своём проекте
+Демо собирает `examples/test_ch32v003` (исходники) с библиотекой из корня —
+копий `led.h`/`led.c` в примере нет (см. `src_filter` в `library.json`).
 
-Скопируйте `include/led.h` и `src/led.c` или подключите репозиторий как
-PlatformIO-зависимость (см. `library.json`). Подробности — в
-[docs/LED_LIBRARY.md](docs/LED_LIBRARY.md).
+## Минимальный пример
+
+```c
+void led_hw_set(uint8_t id, bool state) {
+    /* ваша GPIO-запись для LED id */
+}
+
+int main(void) {
+    led_init();
+    led_set_callback(led_hw_set);
+
+    led_blink(0, 15, 15);           /* LED0 мигает: 250 мс вкл / 250 мс выкл */
+    led_on_for(1, 300);             /* LED1 горит 5 секунд                  */
+    led_start_effect_for(LED_EFFECT_EMERGENCY, 5); /* 5 вспышек на всех     */
+
+    for (;;) {
+        led_process();              /* вызывать 60 раз в секунду */
+        Delay_Ms(16);
+    }
+    return 0;
+}
+```
+
+## Аппаратные пины демо
+
+LED0–LED3 на **PC4–PC7** (GPIOC, активный уровень HIGH).
+
+> Примечание (CH32V003): SysTick работает от HCLK/8, тайминги задержек
+> считайте от `Delay_Ms()` из WCH SDK, а не от SysTick напрямую.
+
+## Документация
+
+- [docs/LED_LIBRARY.md](docs/LED_LIBRARY.md) — полное описание API, эффектов,
+  последовательностей и добавления новых.
+- [CHANGELOG.md](CHANGELOG.md) — история версий.
+
+## Лицензия
+
+MIT. См. [LICENSE](LICENSE).
+
+Copyright (c) 2025–2026 tama18101971.

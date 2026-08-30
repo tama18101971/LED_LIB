@@ -1,7 +1,7 @@
 {
-    "name": "LED_LIB",
+    "name": "led-lib",
     "version": "1.0.0",
-    "description": "Bare-metal LED control library for 4 independent LEDs: per-LED state machines (on/off/on-for/blink/sequences), 12 global effects, auto-stop repeats. C99, no RTOS, no malloc, ~90 bytes RAM, GPIO via user callback.",
+    "description": "Bare-metal LED control library for 4 independent LEDs: per-LED state machines (off/on/on-for/blink/sequences), 12 global effects, auto-stop repeats. C99, no RTOS, no malloc, ~97 bytes RAM for library state, GPIO only via user callback.",
     "keywords": [
         "led",
         "blink",
@@ -11,10 +11,27 @@
         "effects",
         "ch32v003",
         "stm32",
-        "avr"
+        "avr",
+        "no-rtos"
     ],
+    "homepage": "https://github.com/tama18101971/LED_LIB",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/tama18101971/LED_LIB.git"
+    },
+    "authors": [
+        {
+            "name": "tama18101971",
+            "email": "tamagotchi@yandex.ru",
+            "url": "https://github.com/tama18101971"
+        }
+    ],
+    "license": "MIT",
     "platforms": "*",
     "frameworks": "*",
     "headers": "led.h",
-    "src_filter": "+<src/>"
+    "src_filter": "+<src/>",
+    "build": {
+        "flags": "-std=c99"
+    }
 }
