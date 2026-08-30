@@ -1,0 +1,16 @@
+# Files excluded from the PlatformIO package (pio pkg publish)
+.pio
+.pioenvs
+.piolibdeps
+.vscode
+.idea
+compile_commands.json
+*.swp
+*.orig
+.DS_Store
+
+# Repository/tooling files not shipped in the library package
+.git
+.gitignore
+.gitattributes
+AGENTS.md
