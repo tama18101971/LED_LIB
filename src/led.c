@@ -10,7 +10,8 @@
  *    - leds[4]       — массив конечных автоматов (по одному на LED)
  *    - hw_set        — callback для доступа к GPIO
  *    - cur_effect    — текущий глобальный эффект
- *    - g_tick        — глобальный счётчик тиков (растёт бесконечно)
+ *    - out_mask      — кэш последних выставленных состояний GPIO
+ *    - fx_phase / fx_pos / fx_cnt — счётчики встроенных эффектов
  *
  * 2) Вспомогательные функции:
  *    - apply_state() — безопасный вызов hw_set (проверяет на NULL)
@@ -24,9 +25,15 @@
  *    - process_sequence()  — проигрывание массива шагов
  *
  * 4) Функции эффектов (таблица eff_table[]):
- *    - eff_running_fwd / bwd / pp / circle — бегущий огонь
- *    - eff_pair_blink / emergency / etc — мигание
- *    - eff_random_flash — псевдослучайный генератор (xorshift32)
+ *    - eff_running_fwd     — fwd/bwd/circle (общая, по cur_effect)
+ *    - eff_running_pp      — бегущий огонь туда-обратно
+ *    - eff_emergency       — emergency/pair_blink/alternating (общая)
+ *    - eff_double_blink    — double/triple мигание (общая)
+ *    - eff_running_fwd_hold — fwd_hold/bwd_hold (общая)
+ *    - eff_random_flash    — псевдослучайный генератор (xorshift32)
+ *
+ *    Все эффекты продвигают инкрементные счётчики (fx_*), поэтому
+ *    не вызывают программное деление/умножение (__udivsi3/__mulsi3),
  *
  * 5) Публичный API:
  *    - led_init / led_set_callback / led_process
@@ -38,10 +45,13 @@
  * =====================================================================
  *
  *   leds[4]:           4 × 20 = 80 байт
- *   hw_set:            2 байта (указатель на AVR/ARM)
+ *   hw_set:            4 байта (указатель на RV32/ARM)
  *   cur_effect:        1 байт
- *   g_tick:            4 байта
- *   Итого:             ~87 байт (около 90)
+ *   effect_remaining:  4 байта
+ *   out_mask:          1 байт
+ *   driven_mask:       1 байт
+ *   fx_*:              3 байта
+ *   Итого:             ~94 байта (около 90)
  *
  * =====================================================================
  *  ВРЕМЯ ВЫПОЛНЕНИЯ led_process()
@@ -50,6 +60,12 @@
  *   - Цикл по 4 LED: 4 итерации фиксированного размера.
  *   - Внутри switch: до 6 case'ов, каждый O(1).
  *   - Эффект: 1 вызов функции + цикл по 4 LED.
+ *   - GPIO callback вызывается только при ИЗМЕНЕНИИ состояния пина
+ *     (кэш out_mask), а не на каждом тике: стабильные режимы
+ *     (OFF/ON, устоявшиеся фазы BLINK/SEQUENCE) бесплатны.
+ *   - Эффекты не содержат аппаратно дорогих операций: на RV32EC
+ *     нет программного деления — фазы и позиции продвигаются
+ *     инкрементными счётчиками.
  *   - Итого: O(1) — константное время, нет переменных циклов.
  */
 
@@ -134,12 +150,46 @@ static led_effect_t cur_effect = LED_EFFECT_NONE;
 static uint32_t effect_remaining = 0;
 
 /**
- * Глобальный счётчик тиков.
- * Инкрементируется на +1 при каждом вызове led_process().
- * Используется эффектами для вычисления позиций/фаз.
- * Тип uint32_t — переполнится через ~828 дней при 60 Гц.
+ * Кэш последних выставленных состояний GPIO.
+ * Бит id = последнее состояние, переданное в hw_set для LED id.
+ *
+ * Позволяет отсекать избыточные вызовы callback: большинство режимов
+ * (OFF, ON, устоявшиеся фазы BLINK/SEQUENCE) на каждом тике хотят
+ * записать «то же самое». С этим кэшем реальная запись в порт
+ * выполняется только при изменении состояния пина.
  */
-static uint32_t g_tick = 0;
+static uint8_t out_mask = 0;
+
+/**
+ * Маска «пин уже выставлялся».
+ * Бит id устанавливается при ПЕРВОЙ реальной записи на LED id.
+ *
+ * Нужна, чтобы первый тик после led_init() всё равно записал в GPIO
+ * состояние режима (обычно OFF) даже при совпадении с out_mask:
+ * прежний код писал на каждом тике и гарантировал выключение пинов,
+ * попавших в высокий уровень во время сброса/перезапуска. С одним
+ * out_mask первая запись OFF подавлялась бы как «не изменилась».
+ */
+static uint8_t driven_mask = 0;
+
+/**
+ * Счётчики встроенных эффектов.
+ *
+ * Эффекты намеренно НЕ используют глобальный счётчик тиков и формулы
+ * вида (tick / N) % M: на MCU без аппаратного делителя (RV32EC —
+ * CH32V003) любое деление раскрывается в программную процедуру
+ * (~50–100 циклов на вызов). Вместо этого каждый эффект продвигает
+ * инкрементные счётчики:
+ *   fx_phase — фаза эффекта (для blink-подобных и удержание-эффектов)
+ *   fx_pos   — текущая позиция (для бегущих огней)
+ *   fx_cnt   — тиковый делитель внутри фазы/позиции
+ *
+ * Счётчики общие, т.к. одновременно активен не более ОДНОГО эффекта,
+ * а повторно запускаемые эффекты сбрасываются в led_start_effect().
+ */
+static uint8_t fx_phase = 0;
+static uint8_t fx_pos   = 0;
+static uint8_t fx_cnt   = 0;
 
 /* ================================================================== */
 /*  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ                                            */
@@ -148,18 +198,34 @@ static uint32_t g_tick = 0;
 /**
  * Безопасный вызов callback-функции GPIO.
  *
- * Если hw_set установлен (не NULL) — вызывает его с указанным
- * состоянием. Если hw_set == NULL — ничего не делает.
+ * Если hw_set установлен (не NULL) и состояние пина ИЗМЕНИЛОСЬ
+ * относительно кэша out_mask — обновляет кэш и вызывает callback.
+ * Если hw_set == NULL или состояние не изменилось — ничего не делает.
  *
  * Это единственная точка, через которую библиотека взаимодействует
- * с аппаратурой. Благодаря этому она портируется между любыми МК.
+ * с аппаратурой. Благодаря ей (и кэшу out_mask) портруется на любые МК
+ * и не дёргает GPIO при каждом тике без реальной необходимости.
  *
  * @param id     Индекс диода (0..3).
  * @param state  true = включить, false = выключить.
  */
 static void apply_state(uint8_t id, bool state)
 {
-    if (hw_set) {
+    uint8_t bit = (uint8_t)(1u << id);
+
+    /*
+     * Записывать в GPIO, только если:
+     *   - пин ещё ни разу не выставлялся (driven_mask), — гарантия первой
+     *     записи (в т.ч. принудительное выключение на первом тике), или
+     *   - желаемое состояние отличается от последнего (out_mask).
+     * В стабильных режимах (OFF/ON, устоявшиеся фазы BLINK/SEQUENCE)
+     * повторные тики не дёргают callback.
+     */
+    if (hw_set && (!(driven_mask & bit) ||
+                   (((out_mask >> id) ^ (uint8_t)state) & 1u))) {
+        out_mask    = (uint8_t)((out_mask & (uint8_t)~bit) |
+                                (state ? bit : 0u));
+        driven_mask |= bit;
         hw_set(id, state);
     }
 }
@@ -203,8 +269,8 @@ static void set_mode_on(uint8_t id)
  * Обработчик режима OFF — просто поддерживает выключенное состояние.
  *
  * Вызывается при каждом тике, пока диод в режиме OFF.
- * Принудительно выключает диод (на случай, если он был включён
- * аппаратно).
+ * Благодаря кэшу out_mask реальная запись в GPIO происходит только
+ * один раз — при переходе в OFF; все последующие тики бесплатны.
  *
  * @param id  Индекс диода.
  */
@@ -216,7 +282,8 @@ static void process_off(uint8_t id)
 /**
  * Обработчик режима ON — просто поддерживает включённое состояние.
  *
- * Аналогично process_off(), но включает диод.
+ * Аналогично process_off(), но включает диод — тоже только один раз,
+ * остальные тики не дёргают GPIO.
  *
  * @param id  Индекс диода.
  */
@@ -370,99 +437,124 @@ static void process_sequence(uint8_t id)
 /* ================================================================== */
 
 /**
- * Бегущий огонь вперёд: LED0 → LED1 → LED2 → LED3 → LED0 → ...
+ * Продвижение инкрементного счётчика эффектов.
  *
- * Скорость: 1 позиция каждые 10 тиков (~167 мс).
- * Горит ровно 1 диод.
- *
- * @param tick  Глобальный счётчик тиков.
- * @param st    Выходной массив состояний [LED_COUNT].
+ * Универсальный шаг для fx_*: увеличивает значение на 1 и заворачивает
+ * его в диапазон 0..max-1. Одна общая функция вместо дублирования
+ * логики инкремента/сброса в каждом эффекте.
  */
-static void eff_running_fwd(uint32_t tick, bool st[LED_COUNT])
+static uint8_t fx_adv(uint8_t v, uint8_t max)
 {
-    uint8_t pos = (uint8_t)((tick / 10) % LED_COUNT);
-    uint8_t i;
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == pos);
-    }
+    return (uint8_t)((v + 1 < max) ? v + 1 : 0);
 }
 
 /**
- * Бегущий огонь назад: LED3 → LED2 → LED1 → LED0 → LED3 → ...
+ * Бегущий огонь (общий вариант для трёх эффектов).
  *
- * Скорость: 1 позиция каждые 10 тиков.
+ * Одна функция обслуживает LED_EFFECT_RUNNING_FWD, LED_EFFECT_RUNNING_BWD
+ * и LED_EFFECT_RUNNING_CIRCLE, которые отличаются только направлением
+ * и периодом смены позиции:
+ *
+ *   RUNNING_FWD     — вперёд 0→1→2→3, период 10 тиков
+ *   RUNNING_BWD     — назад  3→2→1→0, период 10 тиков
+ *   RUNNING_CIRCLE  — вперёд 0→1→2→3, период 8 тиков
+ *
+ * Направление и период выбираются по текущему эффекту (cur_effect).
+ * Позиция продвигается инкрементом — без деления глобального тика.
+ *
+ * @param st    Выходной массив состояний [LED_COUNT].
  */
-static void eff_running_bwd(uint32_t tick, bool st[LED_COUNT])
+static void eff_running_fwd(bool st[LED_COUNT])
 {
-    uint8_t pos = (uint8_t)((tick / 10) % LED_COUNT);
+    bool bwd = (cur_effect == LED_EFFECT_RUNNING_BWD);
+    uint8_t period = (cur_effect == LED_EFFECT_RUNNING_CIRCLE) ? 8 : 10;
+    uint8_t pos = bwd ? (uint8_t)(LED_COUNT - 1 - fx_pos) : fx_pos;
     uint8_t i;
+
     for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == (LED_COUNT - 1 - pos));
+        st[i] = (i == pos);
+    }
+    fx_cnt = fx_adv(fx_cnt, period);
+    if (fx_cnt == 0) {
+        /* Позиция всегда продвигается ВПЕРЁД; для bwd направление
+         * обеспечивает зеркало на строке отображения (pos). Попытка
+         * дополнительно декрементировать fx_pos давала бы двойной
+         * разворот и последовательность 3,0,1,2... вместо 3,2,1,0... */
+        fx_pos = fx_adv(fx_pos, LED_COUNT);
     }
 }
 
 /**
  * Бегущий огонь туда-обратно: 0→1→2→3→2→1→0→1→...
  *
- * Период = 2 * LED_COUNT - 2 = 6 позиций.
  * Скорость: 1 позиция каждые 10 тиков.
+ * Направление хранится в fx_phase: 0 = вперёд, 1 = назад.
+ * Требует LED_COUNT >= 2.
  */
-static void eff_running_pp(uint32_t tick, bool st[LED_COUNT])
+static void eff_running_pp(bool st[LED_COUNT])
 {
-    uint8_t period = LED_COUNT * 2 - 2;
-    uint8_t pos    = (uint8_t)((tick / 10) % period);
     uint8_t i;
 
-    /* Отражение: позиции 3,4,5 → 3,2,1 */
-    if (pos >= LED_COUNT) {
-        pos = period - pos;
-    }
-
     for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == pos);
+        st[i] = (i == fx_pos);
     }
-}
+    fx_cnt = fx_adv(fx_cnt, 10);
+    if (fx_cnt != 0) return;
 
-/**
- * Вращение по кругу: 0→1→2→3→0→... (тот же eff_running_fwd).
- *
- * Скорость: 1 позиция каждые 8 тиков (~133 мс) — чуть быстрее.
- */
-static void eff_running_circle(uint32_t tick, bool st[LED_COUNT])
-{
-    uint8_t pos = (uint8_t)((tick / 8) % LED_COUNT);
-    uint8_t i;
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i == pos);
-    }
-}
-
-/**
- * Попарное мигание: LED0+LED2 / LED1+LED3.
- *
- * Чётные и нечётные диоды мигают в противофазе.
- * Скорость: переключение каждые 15 тиков (~250 мс).
- */
-static void eff_pair_blink(uint32_t tick, bool st[LED_COUNT])
-{
-    bool on = ((tick / 15) % 2 == 0);
-    uint8_t i;
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i % 2 == 0) ? on : !on;
+    if (fx_phase == 0) {
+        if (fx_pos + 1 >= LED_COUNT) {
+            fx_phase = 1;
+            fx_pos   = (uint8_t)(LED_COUNT - 2);
+        } else {
+            fx_pos++;
+        }
+    } else {
+        if (fx_pos == 0) {
+            fx_phase = 0;
+            fx_pos   = 1;
+        } else {
+            fx_pos--;
+        }
     }
 }
 
 /**
- * Аварийная сигнализация: все 4 диода мигают одновременно.
+ * Мигание (общий вариант для трёх эффектов).
  *
- * Скорость: переключение каждые 5 тиков (~83 мс) — быстро.
+ * Одна функция обслуживает LED_EFFECT_EMERGENCY, LED_EFFECT_PAIR_BLINK
+ * и LED_EFFECT_ALTERNATING, которые отличаются только периодом
+ * переключения и паттерном:
+ *
+ *   EMERGENCY    — все 4 диода сразу, период 5 тиков
+ *   PAIR_BLINK   — чёт/нечет в противофазе, период 15 тиков
+ *   ALTERNATING  — чёт/нечет в противофазе, период 20 тиков
+ *
+ * Период и паттерн выбираются по текущему глобальному эффекту
+ * (cur_effect) — одно копирование кода вместо трёх функций.
+ * Фаза хранится в fx_phase (0 = чётные горят / все включены).
  */
-static void eff_emergency(uint32_t tick, bool st[LED_COUNT])
+static void eff_emergency(bool st[LED_COUNT])
 {
-    bool on = ((tick / 5) % 2 == 0);
     uint8_t i;
+    bool on = (fx_phase == 0);
+    bool all = (cur_effect == LED_EFFECT_EMERGENCY);
+    uint8_t period;
+
+    if (cur_effect == LED_EFFECT_ALTERNATING) {
+        period = 20;
+    } else if (cur_effect == LED_EFFECT_EMERGENCY) {
+        period = 5;
+    } else {
+        period = 15;
+    }
+
     for (i = 0; i < LED_COUNT; i++) {
-        st[i] = on;
+        st[i] = all ? on : (((i & 1) == 0) ? on : !on);
+    }
+
+    fx_cnt = fx_adv(fx_cnt, period);
+    if (fx_cnt == 0) {
+        fx_phase ^= 1;
     }
 }
 
@@ -474,14 +566,11 @@ static void eff_emergency(uint32_t tick, bool st[LED_COUNT])
  * младшие 4 бита которого определяют состояние 4 диодов.
  *
  * Начальное seed: 0xDEADBEEF (может быть любым != 0).
- *
- * @param tick  Используется только для совместимости сигнатуры.
  */
-static void eff_random_flash(uint32_t tick, bool st[LED_COUNT])
+static void eff_random_flash(bool st[LED_COUNT])
 {
     static uint32_t rng = 0xDEADBEEF;
     uint8_t i;
-    (void)tick;  /* Не используется в этом эффекте */
 
     /* xorshift32: 3 XOR-сдвига дают максимальный период 2^32 - 1 */
     rng ^= rng << 13;
@@ -495,125 +584,80 @@ static void eff_random_flash(uint32_t tick, bool st[LED_COUNT])
 }
 
 /**
- * Двойное мигание: ._.__  (все 4 диода вместе).
+ * Двойное/тройное мигание: ._.__ / ._.__.__ (все диоды вместе).
  *
- * Паттерн на 16 фаз (при делителе 5):
- *   Фазы 0-1:  ON  (100 мс)
- *   Фазы 2-3:  OFF (100 мс)
- *   Фазы 4-5:  ON  (100 мс)
- *   Фазы 6-15: OFF (200 мс) — пауза перед повтором
+ * Одна функция обслуживает LED_EFFECT_DOUBLE_BLINK и
+ * LED_EFFECT_TRIPLE_BLINK; паттерн и длина периода выбираются
+ * по текущему эффекту:
+ *
+ *   DOUBLE: 16 фаз, ON на 0-1 и 4-5, OFF на 6-15
+ *   TRIPLE: 21 фаза, ON на 0,1,4,5,8,9, OFF на остальных
+ *
+ * Делитель: 5 тиков на фазу.
  */
-static void eff_double_blink(uint32_t tick, bool st[LED_COUNT])
+static void eff_double_blink(bool st[LED_COUNT])
 {
-    uint8_t phase = (uint8_t)((tick / 5) % 16);
+    bool triple = (cur_effect == LED_EFFECT_TRIPLE_BLINK);
     bool on;
     uint8_t i;
 
-    if (phase < 2)       on = true;
-    else if (phase < 4)  on = false;
-    else if (phase < 6)  on = true;
-    else                 on = false;
+    if (triple) {
+        /* ON на фазах 0,1,4,5,8,9; OFF на остальных */
+        on = (fx_phase < 10) && ((fx_phase & 3) < 2);
+    } else {
+        /* ON на фазах 0-1 и 4-5, OFF на остальных */
+        on = (fx_phase < 2) || (fx_phase >= 4 && fx_phase < 6);
+    }
 
     for (i = 0; i < LED_COUNT; i++) {
         st[i] = on;
     }
-}
 
-/**
- * Тройное мигание: ._.__.__  (все 4 диода вместе).
- *
- * Паттерн на 21 фазу (при делителе 5):
- *   Фазы 0-1:  ON   (100 мс)
- *   Фазы 2-3:  OFF  (100 мс)
- *   Фазы 4-5:  ON   (100 мс)
- *   Фазы 6-7:  OFF  (100 мс)
- *   Фазы 8-9:  ON   (100 мс)
- *   Фазы 10-20: OFF (220 мс) — пауза перед повтором
- */
-static void eff_triple_blink(uint32_t tick, bool st[LED_COUNT])
-{
-    uint8_t phase = (uint8_t)((tick / 5) % 21);
-    bool on;
-    uint8_t i;
-
-    if (phase < 2)       on = true;
-    else if (phase < 4)  on = false;
-    else if (phase < 6)  on = true;
-    else if (phase < 8)  on = false;
-    else if (phase < 10) on = true;
-    else                 on = false;
-
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = on;
+    fx_cnt = fx_adv(fx_cnt, 5);
+    if (fx_cnt == 0) {
+        fx_phase = fx_adv(fx_phase, triple ? 21 : 16);
     }
 }
 
 /**
- * Чередование: LED0+LED2 / LED1+LED3 (медленное).
+ * Бегущий огонь + пауза + удержание крайнего диода 0.75 сек.
  *
- * Скорость: переключение каждые 20 тиков (~333 мс).
- * Визуально: нечётные и чётные диоды меняются местами.
- */
-static void eff_alternating(uint32_t tick, bool st[LED_COUNT])
-{
-    bool on = ((tick / 20) % 2 == 0);
-    uint8_t i;
-    for (i = 0; i < LED_COUNT; i++) {
-        st[i] = (i % 2 == 0) ? on : !on;
-    }
-}
-
-/**
- * Бегущий огонь вперёд + пауза + удержание последнего (LED3) 0.75 сек.
+ * Одна функция обслуживает LED_EFFECT_RUNNING_FWD_HOLD и
+ * LED_EFFECT_RUNNING_BWD_HOLD: направление и удерживаемый диод
+ * выбираются по текущему эффекту.
  *
- * Фазы:
- *   0-39:   бегущий огонь 0→1→2→3 (10 тиков/позиция)
+ * Фазы (fx_phase = 0..104, 1 фаза = 1 тик):
+ *   0-39:   бегущий огонь 0→1→2→3 (или 3→2→1→0), 10 тиков/позиция
  *   40-59:  пауза (все выключены)
- *   60-104: LED3 горит 45 тиков (0.75 сек)
+ *   60-104: крайний диод горит 45 тиков (0.75 сек)
  *   Период: 105 тиков
  */
-static void eff_running_fwd_hold(uint32_t tick, bool st[LED_COUNT])
+static void eff_running_fwd_hold(bool st[LED_COUNT])
 {
-    uint8_t pos;
+    bool bwd = (cur_effect == LED_EFFECT_RUNNING_BWD_HOLD);
     uint8_t i;
-    uint32_t phase = tick % 105;
 
     for (i = 0; i < LED_COUNT; i++) st[i] = false;
 
-    if (phase < 40) {
-        pos = (uint8_t)(phase / 10);
-        if (pos < LED_COUNT) {
-            st[pos] = true;
-        }
-    } else if (phase >= 60) {
-        st[LED_COUNT - 1] = true;
+    if (fx_phase < 40) {
+        st[bwd ? (uint8_t)(LED_COUNT - 1 - fx_pos) : fx_pos] = true;
+    } else if (fx_phase >= 60) {
+        st[bwd ? 0 : (uint8_t)(LED_COUNT - 1)] = true;
     }
-}
 
-/**
- * Бегущий огонь назад + пауза + удержание первого (LED0) 0.75 сек.
- *
- * Фазы:
- *   0-39:   бегущий огонь 3→2→1→0 (10 тиков/позиция)
- *   40-59:  пауза (все выключены)
- *   60-104: LED0 горит 45 тиков (0.75 сек)
- *   Период: 105 тиков
- */
-static void eff_running_bwd_hold(uint32_t tick, bool st[LED_COUNT])
-{
-    uint8_t pos;
-    uint8_t i;
-    uint32_t phase = tick % 105;
+    /* Продвижение фазы: 0..104 */
+    fx_phase = fx_adv(fx_phase, 105);
 
-    for (i = 0; i < LED_COUNT; i++) st[i] = false;
-
-    if (phase < 40) {
-        pos = (uint8_t)(phase / 10);
-        if (pos < LED_COUNT) {
-            st[LED_COUNT - 1 - pos] = true;
+    if (fx_phase < 40) {
+        /* Внутри бегущего участка — инкрементная позиция без деления */
+        fx_cnt = fx_adv(fx_cnt, 10);
+        if (fx_cnt == 0) {
+            fx_pos = fx_adv(fx_pos, LED_COUNT);
         }
-    } else if (phase >= 60) {
-        st[0] = true;
+    } else {
+        /* Подготовка следующего цикла: стартовая позиция */
+        fx_cnt = 0;
+        fx_pos = 0;
     }
 }
 
@@ -622,16 +666,18 @@ static void eff_running_bwd_hold(uint32_t tick, bool st[LED_COUNT])
 /* ================================================================== */
 
 /**
- * Тип функции-эффекта: принимает номер тика и записывает состояния.
+ * Тип функции-эффекта: записывает желаемые состояния 4 диодов.
  *
  * Это ключ к расширяемости: чтобы добавить новый эффект, достаточно:
  *   1) Написать функцию с этой сигнатурой.
  *   2) Добавить её в eff_table[] ниже.
  *   3) Добавить значение в enum led_effect_t в led.h.
  *
- * Никаких изменений в led_process() или другом коде не требуется.
+ * Аналогично led_process() эффекты не зависят от глобального тика:
+ * фазы и позиции продвигаются инкрементными счётчиками (fx_*),
+ * поэтому в функции не передаётся номер тика.
  */
-typedef void (*eff_fn)(uint32_t, bool[LED_COUNT]);
+typedef void (*eff_fn)(bool[LED_COUNT]);
 
 /**
  * Таблица эффектов — индексируется по enum led_effect_t.
@@ -641,24 +687,27 @@ typedef void (*eff_fn)(uint32_t, bool[LED_COUNT]);
  *
  * Добавление нового эффекта:
  *   1) Написать статическую функцию eff_my_new().
- *   2) В led.h добавить: LED_EFFECT_MY_NEW = 11 (перед COUNT).
- *   3) В COUNT увеличить до 12.
- *   4) В таблицу добавить: [LED_EFFECT_MY_NEW] = eff_my_new,
+ *   2) В led.h добавить: LED_EFFECT_MY_NEW (перед COUNT), COUNT увеличить.
+ *   3) В таблицу добавить: [LED_EFFECT_MY_NEW] = eff_my_new,
+ *
+ * Несколько enum-значений могут указывать на ОДНУ функцию — эффекты,
+ * отличающиеся только периодом/направлением, различаются через
+ * cur_effect внутри общей функции (см. eff_running_fwd и др.).
  */
 static const eff_fn eff_table[LED_EFFECT_COUNT] = {
     [LED_EFFECT_NONE]             = (void *)0,
     [LED_EFFECT_RUNNING_FWD]      = eff_running_fwd,
-    [LED_EFFECT_RUNNING_BWD]      = eff_running_bwd,
+    [LED_EFFECT_RUNNING_BWD]      = eff_running_fwd,
     [LED_EFFECT_RUNNING_PP]       = eff_running_pp,
-    [LED_EFFECT_RUNNING_CIRCLE]   = eff_running_circle,
-    [LED_EFFECT_PAIR_BLINK]       = eff_pair_blink,
+    [LED_EFFECT_RUNNING_CIRCLE]   = eff_running_fwd,
+    [LED_EFFECT_PAIR_BLINK]       = eff_emergency,
     [LED_EFFECT_EMERGENCY]        = eff_emergency,
     [LED_EFFECT_RANDOM_FLASH]     = eff_random_flash,
     [LED_EFFECT_DOUBLE_BLINK]     = eff_double_blink,
-    [LED_EFFECT_TRIPLE_BLINK]     = eff_triple_blink,
-    [LED_EFFECT_ALTERNATING]      = eff_alternating,
+    [LED_EFFECT_TRIPLE_BLINK]     = eff_double_blink,
+    [LED_EFFECT_ALTERNATING]      = eff_emergency,
     [LED_EFFECT_RUNNING_FWD_HOLD] = eff_running_fwd_hold,
-    [LED_EFFECT_RUNNING_BWD_HOLD] = eff_running_bwd_hold
+    [LED_EFFECT_RUNNING_BWD_HOLD] = eff_running_fwd_hold
 };
 
 /**
@@ -713,7 +762,11 @@ void led_init(void)
     hw_set           = (void *)0;
     cur_effect       = LED_EFFECT_NONE;
     effect_remaining = 0;
-    g_tick           = 0;
+    out_mask         = 0;
+    driven_mask      = 0;
+    fx_phase         = 0;
+    fx_pos           = 0;
+    fx_cnt           = 0;
 }
 
 void led_set_callback(led_set_fn fn)
@@ -726,10 +779,13 @@ void led_set_callback(led_set_fn fn)
  *
  * Вызывается пользователем 60 раз в секунду (или с другой частотой).
  * Внутри:
- *   1) g_tick++ — инкремент глобального счётчика.
- *   2) Цикл по 4 LED: для каждого вызывается обработчик по режиму.
- *   3) Если хотя бы один LED в EFFECT-режиме — вызвать функцию эффекта,
+ *   1) Цикл по 4 LED: для каждого вызывается обработчик по режиму.
+ *   2) Если хотя бы один LED в EFFECT-режиме — вызвать функцию эффекта,
  *      которая запишет состояния в effect_st[], и применить их.
+ *
+ * Важно: состояние меняется только через apply_state(), поэтому
+ * GPIO callback не вызывается на каждом тике: кэш out_mask отсекает
+ * запись при неизменном состоянии пина.
  *
  * Важно: эффект применяется ПОСЛЕ ручных режимов, поэтому
  * если LED в EFFECT-режиме, его ручной обработчик НЕ вызывается.
@@ -778,7 +834,7 @@ void led_process(void)
         eff_table[cur_effect]) {
 
         /* Вызвать функцию эффекта: она запишет состояния в effect_st[] */
-        eff_table[cur_effect](g_tick, effect_st);
+        eff_table[cur_effect](effect_st);
 
         /* Применить состояния только к тем LED, которые в EFFECT-режиме */
         for (i = 0; i < LED_COUNT; i++) {
@@ -795,9 +851,6 @@ void led_process(void)
             }
         }
     }
-
-    /* Инкремент счётчика тиков после рендеринга (первый тик = 0) */
-    g_tick++;
 }
 
 /* ================================================================== */
@@ -955,7 +1008,10 @@ void led_start_effect(led_effect_t effect)
 
     cur_effect       = effect;
     effect_remaining = 0;
-    g_tick           = 0;
+    /* Сброс счётчиков эффекта, чтобы новый эффект стартовал с фазы 0 */
+    fx_phase = 0;
+    fx_pos   = 0;
+    fx_cnt   = 0;
     for (i = 0; i < LED_COUNT; i++) {
         if (leds[i].mode != LED_MODE_EFFECT) {
             leds[i].mode = LED_MODE_EFFECT;
