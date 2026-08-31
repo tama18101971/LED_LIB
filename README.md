@@ -18,13 +18,6 @@ Bare-metal библиотека для **4 независимых светоди
 
 ## Установка
 
-**PlatformIO / PlatformIO Registry** (рекомендуется):
-
-```ini
-[env:your_board]
-lib_deps = led-lib
-```
-
 **Из GitHub:**
 
 ```ini
