@@ -1,7 +1,7 @@
 {
     "name": "led-lib",
-    "version": "1.0.1",
-    "description": "Bare-metal LED control library for 4 independent LEDs: per-LED state machines (off/on/on-for/blink/sequences), 12 global effects, auto-stop repeats. C99, no RTOS, no malloc, ~97 bytes RAM for library state, GPIO only via user callback.",
+    "version": "2.0.0",
+    "description": "Bare-metal LED control library for 1..8 independent LEDs: per-LED state machines (off/on/on-for/blink/sequences), 12 global effects with auto-stop repeats, optional module compilation (LED_USE_*), interrupt-safe mutators via LED_ENTER_CRITICAL. C99, no RTOS, no malloc, no libc, ~100 bytes RAM (LED_COUNT=4), GPIO only via user callback.",
     "keywords": [
         "led",
         "blink",
@@ -12,6 +12,7 @@
         "ch32v003",
         "stm32",
         "avr",
+        "esp32",
         "no-rtos"
     ],
     "homepage": "https://github.com/tama18101971/LED_LIB",
@@ -30,7 +31,17 @@
     "platforms": "*",
     "frameworks": "*",
     "headers": "led.h",
-    "src_filter": "+<src/>",
+    "export": {
+        "exclude": [
+            "AGENTS.md",
+            ".gitignore",
+            ".github",
+            ".vscode",
+            "docs",
+            "platformio.ini",
+            "test"
+        ]
+    },
     "build": {
         "flags": "-std=c99"
     }

@@ -1,0 +1,80 @@
+# LED_LIB CI: host tests across configurations + firmware build.
+#
+# Host tests: pure C99, self-contained runner (test/test_led_lib), any gcc.
+# Firmware: PlatformIO build of the CH32V003 demo from the repo root.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: ''
+          - config: '-DLED_COUNT=1'
+          - config: '-DLED_COUNT=2'
+          - config: '-DLED_COUNT=3'
+          - config: '-DLED_COUNT=5'
+          - config: '-DLED_COUNT=8'
+          - config: '-DLED_USE_EFFECTS=0'
+          - config: '-DLED_USE_SEQUENCES=0'
+          - config: '-DLED_USE_EFFECTS=0 -DLED_USE_SEQUENCES=0'
+          - config: '-DLED_USE_RUNNING_EFFECTS=0'
+          - config: '-DLED_USE_PINGPONG_EFFECT=0'
+          - config: '-DLED_USE_BLINK_EFFECTS=0'
+          - config: '-DLED_USE_MULTI_BLINK_EFFECTS=0'
+          - config: '-DLED_USE_RANDOM_EFFECT=0'
+          - config: '-DLED_USE_HOLD_EFFECTS=0'
+          - config: '-DLED_COUNT=8 -DLED_USE_SEQUENCES=0 -DLED_USE_RUNNING_EFFECTS=0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tests (all warnings, -Werror)
+        run: >
+          gcc -std=c99 -Wall -Wextra -Wconversion -Wpedantic -Werror
+          ${{ matrix.config }}
+          -Iinclude test/test_led_lib/test_led_lib.c src/led.c -o test_bin
+
+      - name: Run tests
+        run: ./test_bin
+
+      - name: Library compiles with -Werror (pedantic C99)
+        run: >
+          gcc -std=c99 -pedantic-errors -Wall -Wextra -Werror
+          ${{ matrix.config }}
+          -Iinclude -c src/led.c -o /dev/null
+
+  firmware:
+    name: Firmware build (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [ch32v003, native]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-${{ matrix.env }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ matrix.env }}-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Build
+        run: pio run -e ${{ matrix.env }}
+      - name: Run native tests
+        if: matrix.env == 'native'
+        run: pio test -e native -vv
