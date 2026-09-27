@@ -394,19 +394,56 @@ static void set_mode_on(uint8_t id)
     set_mode_level(id, 1u);
 }
 
+/**
+ * Погасить все каналы, находящиеся в режиме `mode`.
+ *
+ * Три места (packed_reset, stop_effect_inner и led_stop_owner) делали один
+ * и тот же обход массива со своим телом цикла. Тела совпадали побайтово,
+ * различалась только предикат, поэтому общий помощник заменяет три копии
+ * цикла одной.
+ *
+ * Обращение по указателю обязательно: вызов set_mode_off() внутри цикла
+ * перебивает живые регистры, и при индексации компилятор вынужден был
+ * сохранять базу leds[] в стеке (store/reload на каждой итерации).
+ *
+ * @param mode      Режим-владелец: LED_MODE_PACKED, LED_MODE_EFFECT либо
+ *                  (при or_higher) нижняя граница «таймерного» режима.
+ * @param or_higher true — гасить все каналы с mode >= заданного (used by
+ *                  led_stop_owner); false — только каналы с mode == заданного.
+ * @return          1-based номер последнего погашенного канала, 0 — таких не
+ *                  было. Нужен только для LED_USE_EVENTS (идентификатор
+ *                  «подсистемы» в LED_EV_PATTERN_END).
+ */
+static uint8_t off_by_mode(uint8_t mode, bool or_higher)
+{
+    led_state_t *s = leds;
+    uint8_t      last = 0;
+    uint8_t      i;
+
+    for (i = 0; i < LED_COUNT; i++, s++) {
+        if (or_higher ? (s->mode >= mode) : (s->mode == mode)) {
+            set_mode_off(i);
+            last = (uint8_t)(i + 1u);
+        }
+    }
+    return last;
+}
+
 static void on_for_locked(uint8_t id, uint16_t ticks)
 {
+    led_state_t *s = &leds[id];
+
     if (ticks == 0) {
         set_mode_off(id);
         return;
     }
-    leds[id].mode  = (uint8_t)LED_MODE_ON_FOR;
-    leds[id].timer = ticks;
-    leds[id].level = 1u;
+    s->mode  = (uint8_t)LED_MODE_ON_FOR;
+    s->timer = ticks;
+    s->level = 1u;
     apply_level(id, 1u);
 #if LED_USE_EVENTS
     if (ev_cb != NULL) {
-        leds[id].pass = 0;
+        s->pass = 0;
         ev_cycle_start(id, 0u);
     }
 #endif
@@ -415,20 +452,22 @@ static void on_for_locked(uint8_t id, uint16_t ticks)
 static void blink_locked(uint8_t id, uint8_t on_level, uint16_t on_ticks,
                          uint8_t off_level, uint16_t off_ticks)
 {
+    led_state_t *s = &leds[id];
+
     if (on_ticks == 0 || off_ticks == 0) {
         set_mode_off(id);
         return;
     }
-    leds[id].mode      = (uint8_t)(LED_MODE_BLINK | LED_M_PHASE);
-    leds[id].timer     = on_ticks;    /* текущая (первая) фаза */
-    leds[id].on_ticks  = on_ticks;
-    leds[id].off_ticks = off_ticks;
-    leds[id].level     = on_level;
-    leds[id].level2    = off_level;
+    s->mode      = (uint8_t)(LED_MODE_BLINK | LED_M_PHASE);
+    s->timer     = on_ticks;    /* текущая (первая) фаза */
+    s->on_ticks  = on_ticks;
+    s->off_ticks = off_ticks;
+    s->level     = on_level;
+    s->level2    = off_level;
     apply_level(id, on_level);
 #if LED_USE_EVENTS
     if (ev_cb != NULL) {
-        leds[id].pass = 0;
+        s->pass = 0;
         ev_cycle_start(id, 0u);
     }
 #endif
@@ -437,23 +476,28 @@ static void blink_locked(uint8_t id, uint8_t on_level, uint16_t on_ticks,
 #if LED_USE_SEQUENCES
 static void play_locked(uint8_t id, const led_sequence_t *seq)
 {
+    led_state_t *s = &leds[id];
+
     if (seq == NULL || seq->steps == NULL || seq->count == 0) {
         return;
     }
-    leds[id].mode    = (uint8_t)(LED_MODE_SEQUENCE |
-                                 ((seq->loop != false) ? LED_M_LOOP : 0u));
-    leds[id].seq     = seq->steps;
-    leds[id].seq_len = seq->count;
-    leds[id].seq_idx = 0;
+    /* Один указатель на канал: адрес leds[id] вычисляется один раз, а не
+     * заново под каждое поле (индексация с масштабом id*sizeof(led_state_t)
+     * на RV32EC стоит трёх инструкций slli/add/slli). */
+    s->mode    = (uint8_t)(LED_MODE_SEQUENCE |
+                          ((seq->loop != false) ? LED_M_LOOP : 0u));
+    s->seq     = seq->steps;
+    s->seq_len = seq->count;
+    s->seq_idx = 0;
     /* Нулевая длительность шага трактуется как 1 тик. Первый шаг
      * применяется немедленно — в том числе ведущий LED_STEP_OFF(n),
      * то есть «стартовать через n тиков» без отдельного API. */
-    leds[id].timer  = (seq->steps[0].ticks != 0) ? seq->steps[0].ticks : 1u;
-    leds[id].level  = seq->steps[0].level;
-    apply_level(id, leds[id].level);
+    s->timer   = (seq->steps[0].ticks != 0) ? seq->steps[0].ticks : 1u;
+    s->level   = seq->steps[0].level;
+    apply_level(id, s->level);
 #if LED_USE_EVENTS
     if (ev_cb != NULL) {
-        leds[id].pass = 0;
+        s->pass = 0;
         ev_cycle_start(id, 0u);
     }
 #endif
@@ -566,6 +610,64 @@ static void tick_channel(uint8_t id)
 #if LED_USE_EFFECTS
 
 /**
+ * Длительность одного цикла эффекта (в тиках) для пересчёта повторов.
+ * Индекс и правила заполнения — те же, что у eff_table[].
+ *
+ * Тип uint8_t, а не uint16_t: максимум при LED_COUNT = 8 — это
+ * LED_HOLD_RUN + LED_HOLD_PAUSE + LED_HOLD_TIME = 145, что на 12 байт
+ * меньше таблицы в полусловах. Период возвращается наружу только как
+ * множитель для repeats, а произведение всё равно считается в uint32_t.
+ *
+ * Объявлена ДО функций эффектов: eff_group_blink() берёт из неё длительность
+ * одной фазы как eff_period[cur_effect] / 2, и это дешевле цепочки
+ * сравнений «какой именно эффект запущен».
+ */
+static const uint8_t eff_period[LED_EFFECT_COUNT] = {
+    [LED_EFFECT_NONE]             = 0,
+#if LED_USE_RUNNING_EFFECTS
+    [LED_EFFECT_RUNNING_FWD]      = LED_RUN_PERIOD,
+    [LED_EFFECT_RUNNING_BWD]      = LED_RUN_PERIOD,
+    [LED_EFFECT_RUNNING_CIRCLE]   = LED_CIRCLE_PERIOD,
+#endif
+#if LED_USE_PINGPONG_EFFECT
+    [LED_EFFECT_RUNNING_PP]       = (uint16_t)((2u * (unsigned)LED_COUNT - 2u) * 10u),
+#endif
+#if LED_USE_BLINK_EFFECTS
+    [LED_EFFECT_PAIR_BLINK]       = 30,   /* 2 фазы × 15 тиков */
+    [LED_EFFECT_EMERGENCY]        = 10,   /* 2 фазы × 5 тиков  */
+    [LED_EFFECT_ALTERNATING]      = 40,   /* 2 фазы × 20 тиков */
+#endif
+#if LED_USE_RANDOM_EFFECT
+    [LED_EFFECT_RANDOM_FLASH]     = 1,    /* без цикла: repeats = тики */
+#endif
+#if LED_USE_MULTI_BLINK_EFFECTS
+    [LED_EFFECT_DOUBLE_BLINK]     = 80,   /* 16 фаз × 5 тиков */
+    [LED_EFFECT_TRIPLE_BLINK]     = 105,  /* 21 фаза × 5 тиков */
+#endif
+#if LED_USE_HOLD_EFFECTS
+    [LED_EFFECT_RUNNING_FWD_HOLD] = (uint16_t)(LED_HOLD_RUN + LED_HOLD_PAUSE + LED_HOLD_TIME),
+    [LED_EFFECT_RUNNING_BWD_HOLD] = (uint16_t)(LED_HOLD_RUN + LED_HOLD_PAUSE + LED_HOLD_TIME),
+#endif
+};
+
+/*
+ * Страховка от тихой порчи: eff_period[] сужена до uint8_t ради экономии
+ * 12 байт ROM, поэтому любое будущее увеличение периода обязано упасть на
+ * сборке, а не переполнить таблицу. Верхняя граница берётся из худшего
+ * случая LED_COUNT = 8 (145), а не из текущего значения.
+ */
+LED_SA(LED_COUNT <= 8u, eff_period_count_bound);
+#if LED_USE_HOLD_EFFECTS
+LED_SA(((unsigned)LED_COUNT * 10u + 65u) <= 255u, eff_period_hold_fits);
+#endif
+#if LED_USE_PINGPONG_EFFECT
+LED_SA(((2u * (unsigned)LED_COUNT - 2u) * 10u) <= 255u, eff_period_pp_fits);
+#endif
+#if LED_USE_RUNNING_EFFECTS
+LED_SA(((unsigned)LED_COUNT * 10u) <= 255u, eff_period_run_fits);
+#endif
+
+/**
  * Инкремент счётчика с заворотом в диапазоне 0..max-1.
  * Общая функция вместо дублирования инкрементов в каждом эффекте.
  */
@@ -641,15 +743,11 @@ static uint8_t eff_group_blink(void)
 {
     bool    on  = (fx_phase == 0);
     bool    all = (cur_effect == (uint8_t)LED_EFFECT_EMERGENCY);
-    uint8_t period;
-
-    if (cur_effect == (uint8_t)LED_EFFECT_ALTERNATING) {
-        period = 20;
-    } else if (cur_effect == (uint8_t)LED_EFFECT_EMERGENCY) {
-        period = 5;
-    } else {
-        period = 15;
-    }
+    /* Все три эффекта этой группы имеют ровно две равные фазы, поэтому
+     * длительность фазы = eff_period[эффекта] / 2 (30/2=15, 10/2=5,
+     * 40/2=20). Одна загрузка из таблицы заменяет цепочку из двух
+     * сравнений с тремя константами. */
+    uint8_t period = (uint8_t)(eff_period[cur_effect] >> 1);
 
     fx_cnt = fx_adv(fx_cnt, period);
     if (fx_cnt == 0) {
@@ -669,14 +767,17 @@ static uint8_t eff_group_blink(void)
  */
 static uint8_t eff_multi_blink(void)
 {
-    bool triple = (cur_effect == (uint8_t)LED_EFFECT_TRIPLE_BLINK);
-    bool on;
-
-    if (triple) {
-        on = (fx_phase < 10) && ((fx_phase & 3u) < 2u);
-    } else {
-        on = (fx_phase < 2) || (fx_phase >= 4 && fx_phase < 6);
-    }
+    /* Оба эффекта устроены одинаково — «две фазы из каждых четырёх горят,
+     * остальные темно», — и различаются только длиной цикла и числом
+     * таких четвёрок. Поэтому условие «горит» одно на оба:
+     *     fx_phase < lit и (fx_phase % 4) < 2
+     *   DOUBLE: lit = 6  (фазы 0,1,4,5;  цикл 16 фаз)
+     *   TRIPLE: lit = 10 (фазы 0,1,4,5,8,9; цикл 21 фаза)
+     * Раньше здесь стояли две разные формулы, и вторая обходилась в
+     * три сравнения вместо одного общего условия. */
+    bool    triple = (cur_effect == (uint8_t)LED_EFFECT_TRIPLE_BLINK);
+    uint8_t lit    = triple ? (uint8_t)10u : (uint8_t)6u;
+    bool    on     = (fx_phase < lit) && ((fx_phase & 3u) < 2u);
 
     fx_cnt = fx_adv(fx_cnt, (uint8_t)5u);
     if (fx_cnt == 0) {
@@ -719,23 +820,28 @@ static uint8_t eff_random_flash(void)
 static uint8_t eff_running_hold(void)
 {
     bool    bwd  = (cur_effect == (uint8_t)LED_EFFECT_RUNNING_BWD_HOLD);
+    uint8_t last = (uint8_t)(LED_COUNT - 1u);
     uint8_t mask = 0;
     uint8_t run  = LED_HOLD_RUN;
 
     if (fx_phase < run) {
-        mask = (uint8_t)(1u << (bwd ? (uint8_t)(LED_COUNT - 1u - fx_pos)
-                                    : fx_pos));
+        mask = (uint8_t)(1u << (bwd ? (uint8_t)(last - fx_pos) : fx_pos));
     } else if (fx_phase >= (uint8_t)(run + LED_HOLD_PAUSE)) {
-        mask = (uint8_t)(1u << (bwd ? 0u : (uint8_t)(LED_COUNT - 1u)));
+        /* Удержание крайнего диода:fx_pos паркуется на последней позиции,
+         * и тогда ОБЩАЯ формула бега даёт правильный «край» в обоих
+         * направлениях сразу — вперёд даёт last, назад last - last = 0.
+         * Раньше для этого случая была вторая копия выражения 1u << ...,
+         * отличавшаяся только константой. */
+        fx_pos = last;
+        mask   = (uint8_t)(1u << (bwd ? (uint8_t)(last - fx_pos) : fx_pos));
     }
 
     fx_phase = fx_adv(fx_phase, LED_HOLD_PERIOD);
 
-    if (fx_phase == 0) {
-        /* Новый цикл: бег начинается с чистого счётчика. */
-        fx_cnt = 0;
-        fx_pos = 0;
-    } else if (fx_phase < run) {
+    /* Счётчики бега живут только внутри фазы RUN. Нулевая фаза (новый
+     * цикл) и всё, что после RUN, обнуляют их одинаково — раньше это
+     * были две отдельные ветви с одинаковым телом. */
+    if ((fx_phase != 0u) && (fx_phase < run)) {
         fx_cnt = fx_adv(fx_cnt, (uint8_t)10u);
         if (fx_cnt == 0) {
             fx_pos = fx_adv(fx_pos, (uint8_t)LED_COUNT);
@@ -789,38 +895,6 @@ static const eff_fn eff_table[LED_EFFECT_COUNT] = {
 #endif
 };
 
-/**
- * Длительность одного цикла эффекта (в тиках) для пересчёта повторов.
- * Индекс и правила заполнения — те же, что у eff_table[].
- */
-static const uint16_t eff_period[LED_EFFECT_COUNT] = {
-    [LED_EFFECT_NONE]             = 0,
-#if LED_USE_RUNNING_EFFECTS
-    [LED_EFFECT_RUNNING_FWD]      = LED_RUN_PERIOD,
-    [LED_EFFECT_RUNNING_BWD]      = LED_RUN_PERIOD,
-    [LED_EFFECT_RUNNING_CIRCLE]   = LED_CIRCLE_PERIOD,
-#endif
-#if LED_USE_PINGPONG_EFFECT
-    [LED_EFFECT_RUNNING_PP]       = (uint16_t)((2u * (unsigned)LED_COUNT - 2u) * 10u),
-#endif
-#if LED_USE_BLINK_EFFECTS
-    [LED_EFFECT_PAIR_BLINK]       = 30,   /* 2 фазы × 15 тиков */
-    [LED_EFFECT_EMERGENCY]        = 10,   /* 2 фазы × 5 тиков  */
-    [LED_EFFECT_ALTERNATING]      = 40,   /* 2 фазы × 20 тиков */
-#endif
-#if LED_USE_RANDOM_EFFECT
-    [LED_EFFECT_RANDOM_FLASH]     = 1,    /* без цикла: repeats = тики */
-#endif
-#if LED_USE_MULTI_BLINK_EFFECTS
-    [LED_EFFECT_DOUBLE_BLINK]     = 80,   /* 16 фаз × 5 тиков */
-    [LED_EFFECT_TRIPLE_BLINK]     = 105,  /* 21 фаза × 5 тиков */
-#endif
-#if LED_USE_HOLD_EFFECTS
-    [LED_EFFECT_RUNNING_FWD_HOLD] = (uint16_t)(LED_HOLD_RUN + LED_HOLD_PAUSE + LED_HOLD_TIME),
-    [LED_EFFECT_RUNNING_BWD_HOLD] = (uint16_t)(LED_HOLD_RUN + LED_HOLD_PAUSE + LED_HOLD_TIME),
-#endif
-};
-
 #endif /* LED_USE_EFFECTS */
 
 /* ================================================================== */
@@ -839,11 +913,14 @@ static const uint16_t eff_period[LED_EFFECT_COUNT] = {
  */
 static void packed_apply(uint8_t dev, uint8_t level)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint8_t      i;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        if (((dev & (uint8_t)(1u << i)) != 0u) &&
-            (leds[i].mode == (uint8_t)LED_MODE_PACKED)) {
+    /* Маска «сдвигается на канал»: проверяется МЛАДШИЙ бит, поэтому
+     * 1<<i вычислять не нужно — достаточно сдвигать dev вправо на бит
+     * за итерацию. Это дешевле, чем отдельный счётчик бита. */
+    for (i = 0; i < LED_COUNT; i++, s++, dev = (uint8_t)(dev >> 1)) {
+        if (((dev & 1u) != 0u) && (s->mode == (uint8_t)LED_MODE_PACKED)) {
             apply_level(i, level);
         }
     }
@@ -852,12 +929,13 @@ static void packed_apply(uint8_t dev, uint8_t level)
 /** Забрать каналы маски dev в режим LED_MODE_PACKED. */
 static void packed_take(uint8_t dev)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint8_t      i;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        if ((dev & (uint8_t)(1u << i)) != 0u) {
-            leds[i].mode  = (uint8_t)LED_MODE_PACKED;
-            leds[i].timer = 0;   /* уровнем занимается упакованный паттерн */
+    for (i = 0; i < LED_COUNT; i++, s++, dev = (uint8_t)(dev >> 1)) {
+        if ((dev & 1u) != 0u) {
+            s->mode  = (uint8_t)LED_MODE_PACKED;
+            s->timer = 0;   /* уровнем занимается упакованный паттерн */
         }
     }
 }
@@ -920,10 +998,9 @@ static void packed_load(uint32_t w)
  */
 static void packed_reset(void)
 {
-    uint8_t i;
 #if LED_USE_EVENTS
     bool was_active = (pc_active != 0u);
-    uint8_t id = 0;
+    uint8_t last;
 #endif
 
     pc_active = 0;
@@ -935,18 +1012,15 @@ static void packed_reset(void)
     pc_phase  = 0;
     pc_timer  = 0;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        if (leds[i].mode == (uint8_t)LED_MODE_PACKED) {
 #if LED_USE_EVENTS
-            id = i;
-#endif
-            set_mode_off(i);
-        }
-    }
-#if LED_USE_EVENTS
+    last = off_by_mode((uint8_t)LED_MODE_PACKED, false);
     if (was_active && ev_cb != NULL) {
-        ev_pattern_end(id);
+        /* last == 0, если каналов в режиме PACKED не было; was_active
+         * гарантирует, что был хотя бы один. */
+        ev_pattern_end((uint8_t)(last - 1u));
     }
+#else
+    (void)off_by_mode((uint8_t)LED_MODE_PACKED, false);
 #endif
 }
 
@@ -1038,16 +1112,11 @@ static void packed_tick(void)
 
 static void stop_effect_inner(void)
 {
-    uint8_t i;
 #if LED_USE_EVENTS
     bool was_active = (cur_effect != (uint8_t)LED_EFFECT_NONE);
 #endif
 
-    for (i = 0; i < LED_COUNT; i++) {
-        if (leds[i].mode == LED_MODE_EFFECT) {
-            set_mode_off(i);
-        }
-    }
+    (void)off_by_mode((uint8_t)LED_MODE_EFFECT, false);
     cur_effect       = (uint8_t)LED_EFFECT_NONE;
     effect_remaining = 0;
 #if LED_USE_EVENTS
@@ -1070,7 +1139,8 @@ static void stop_effect_inner(void)
  */
 static void launch_effect(led_effect_t effect, uint32_t ticks, bool force)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint8_t      i;
 
     if ((unsigned int)effect >= (unsigned int)LED_EFFECT_COUNT) {
         return;
@@ -1092,9 +1162,9 @@ static void launch_effect(led_effect_t effect, uint32_t ticks, bool force)
     fx_pos   = 0;
     fx_cnt   = 0;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        leds[i].mode = LED_MODE_EFFECT;
-        leds[i].level = 0u;
+    for (i = 0; i < LED_COUNT; i++, s++) {
+        s->mode  = LED_MODE_EFFECT;
+        s->level = 0u;
     }
 #if LED_USE_EVENTS
     if (ev_cb != NULL) {
@@ -1122,13 +1192,15 @@ static uint16_t effect_period(led_effect_t effect)
 static uint32_t next_change_ticks(void)
 {
     uint32_t best = LED_TICKS_FOREVER;
-    uint8_t  i;
+    const led_state_t *s = leds;
 
     /* Один таймер на канал: режимы без переходов (ON/OFF/EFFECT/PACKED)
-     * держат timer == 0 и просто отсекаются, без switch'а по режиму. */
-    for (i = 0; i < LED_COUNT; i++) {
-        if ((leds[i].timer != 0u) && ((uint32_t)leds[i].timer < best)) {
-            best = (uint32_t)leds[i].timer;
+     * держат timer == 0 и просто отсекаются, без switch'а по режиму.
+     * Обход указателем: индексация потребовала бы умножения id на
+     * sizeof(led_state_t) = 20 (три инструкции) на каждой итерации. */
+    for (; s < &leds[LED_COUNT]; s++) {
+        if ((s->timer != 0u) && ((uint32_t)s->timer < best)) {
+            best = (uint32_t)s->timer;
         }
     }
 #if LED_USE_EFFECTS
@@ -1165,28 +1237,31 @@ static bool patterns_active(void)
 }
 
 /**
- * Снять владение, если таймерных паттернов не осталось.
+ * Снятие владения развёрнуто прямо в led_advance() — и это требование по
+ * размеру кода, а не стилистический выбор.
  *
- * Вызывается в конце led_advance(). Проверка намеренно делается на
- * каждом advance, а не «по событию окончания»: у паттернов много точек
- * завершения (таймер канала, конец последовательности, остановка
- * эффекта, STOP упакованной команды), и единственное место, где хост
- * гарантированно «видит» состояние, — момент возврата из advance.
+ * Проверка делается на каждом advance, а не «по событию окончания»: у
+ * паттернов много точек завершения (таймер канала, конец последовательности,
+ * остановка эффекта, STOP упакованной команды), и единственное место, где
+ * хост гарантированно «видит» состояние, — момент возврата из advance.
+ *
+ * Два пути снятия владения намеренно выглядят по-разному:
+ *   - выход по LED_TICKS_FOREVER: таймерных паттернов нет, поэтому
+ *     владение снимается ОДНОЙ безусловной записью — проверять «а был ли
+ *     владелец» бессмысленно, результат один и тот же;
+ *   - выход по исчерпанию ticks: нужен patterns_active(), потому что за
+ *     прошедшие тики паттерны могли завершиться.
+ * Сведение их в одну функцию с флагом заставляет компилятор развернуть
+ * на месте вызова ОБЕ копии проверки (плюс третью — сам patterns_active),
+ * и led_advance() вырастает.
  *
  * Следствие (и это же контракт): объявлять владение нужно вместе с
  * запуском паттерна, в одном месте кода. Владение, заявленное без
  * паттерна, снимается ближайшим advance — индикатор свободен.
  */
-static void owner_check(void)
-{
-    if ((cur_owner != (uint8_t)LED_OWNER_NONE) && !patterns_active()) {
-        cur_owner = (uint8_t)LED_OWNER_NONE;
-    }
-}
 
 /**
  * Промахнуть n тиков, в течение которых переходов не будет.
- *
  * Вызывается только когда next_change_ticks() > n, поэтому все
  * счётчики строго больше n и остаются >= 1 — «проматывание» эквивалентно
  * n вызовам led_advance(1) с точки зрения состояния. Никаких вызовов
@@ -1196,17 +1271,18 @@ static void owner_check(void)
  */
 static void idle_ticks(uint32_t n)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint8_t      i;
 
-    for (i = 0; i < LED_COUNT; i++) {
-        if (leds[i].timer != 0u) {
-            leds[i].timer = (uint16_t)((uint32_t)leds[i].timer - n);
+    for (i = 0; i < LED_COUNT; i++, s++) {
+        if (s->timer != 0u) {
+            s->timer = (uint16_t)((uint32_t)s->timer - n);
             /* Уровень текущей фазы обязателен: смена фазы происходит
              * на последнем тике фазы, и новый уровень «догоняется»
              * первым же тиком следующей фазы. Без apply_level() здесь
              * пакетный advance() показал бы старый уровень дольше,
              * чем тик за тиком. */
-            apply_level(i, leds[i].level);
+            apply_level(i, s->level);
         }
     }
 #if LED_USE_PACKED_COMMANDS
@@ -1222,7 +1298,10 @@ static void idle_ticks(uint32_t n)
 /** Один тик: обработка переходов всех каналов и глобальных паттернов. */
 static void tick_one(void)
 {
-    uint8_t i;
+#if LED_USE_EFFECTS
+    led_state_t *s = leds;
+#endif
+    uint8_t      i;
 
     /* Шаг 1: каналы. Не-таймерные режимы (ON/OFF/EFFECT/PACKED) внутри
      * tick_channel() отсекаются одной проверкой timer == 0. */
@@ -1245,10 +1324,15 @@ static void tick_one(void)
         } else {
             uint8_t effect_mask = eff_table[cur_effect]();
 
-            for (i = 0; i < LED_COUNT; i++) {
-                if (leds[i].mode == LED_MODE_EFFECT) {
-                    leds[i].level = (uint8_t)((effect_mask >> i) & 1u);
-                    apply_level(i, leds[i].level);
+            /* Обход указателем: и состояние канала, и его индекс нужны
+             * одновременно, а leds[i] пересчитывал бы адрес заново.
+             * Приведение к unsigned нужно и по существу (сдвиг маски),
+             * и ради -Wconversion: uint8_t повышается до int, и
+             * пересечение с 1u было бы знаковым преобразованием. */
+            for (s = leds, i = 0; i < LED_COUNT; i++, s++) {
+                if (s->mode == LED_MODE_EFFECT) {
+                    s->level = (uint8_t)(((unsigned)effect_mask >> i) & 1u);
+                    apply_level(i, s->level);
                 }
             }
 
@@ -1272,7 +1356,8 @@ static void tick_one(void)
 
 void led_init(void)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint8_t      i;
 
     LED_ENTER_CRITICAL();
 
@@ -1284,12 +1369,20 @@ void led_init(void)
      * (on/off_ticks, level2, seq, pass) — параметры режима, они имеют
      * смысл только вместе с ним, а каждый мутатор (led_blink/led_play/…)
      * записывает их сам. Это экономит Store'ы на каждый канал.
+     *
+     * Граница обхода — указатель на конец массива: сравнение указателей
+     * не требует пересчёта id*sizeof(led_state_t) на каждом шаге.
      */
+    for (; s < &leds[LED_COUNT]; s++) {
+        s->timer = 0;
+        s->level = 0;
+        s->mode  = (uint8_t)LED_MODE_OFF;
+    }
+
+    /* Кэш вывода обнуляется отдельным проходом: leds[] и out_level[] —
+     * два разных массива, и общий счётчик индексов им не нужен. */
     for (i = 0; i < LED_COUNT; i++) {
-        leds[i].timer = 0;
-        leds[i].level = 0;
-        leds[i].mode  = (uint8_t)LED_MODE_OFF;
-        out_level[i]  = 0;
+        out_level[i] = 0;
     }
 
     /*
@@ -1359,7 +1452,10 @@ void led_advance(uint32_t ticks)
         uint32_t step = next_change_ticks();
 
         if (step == LED_TICKS_FOREVER) {
-            break;   /* таймерных паттернов нет: время ни на что не влияет */
+            /* Таймерных паттернов нет: время ни на что не влияет, и
+             * владение индикатором снимается тут же. */
+            cur_owner = (uint8_t)LED_OWNER_NONE;
+            return;
         }
         /* Защитные ограничения: 0 недопустим (см. контракт API), а
          * счётчики каналов — uint16_t, поэтому один промах не длиннее
@@ -1374,19 +1470,22 @@ void led_advance(uint32_t ticks)
             if (ticks != 0u) {
                 idle_ticks(ticks);
             }
-            ticks = 0u;
-        } else {
-            /* Проматываем тики без переходов, затем обрабатываем тик,
-             * на котором переход происходит. */
-            if (step > 1u) {
-                idle_ticks(step - 1u);
-            }
-            ticks -= step;
-            tick_one();
+            break;
         }
+        /* Проматываем тики без переходов, затем обрабатываем тик,
+         * на котором переход происходит. */
+        if (step > 1u) {
+            idle_ticks(step - 1u);
+        }
+        ticks -= step;
+        tick_one();
     }
 
-    owner_check();
+    /* Владелец мог быть — перепроверяем: за прошедшие тики паттерны
+     * завершились. Если владельца нет, проверять нечего. */
+    if ((cur_owner != (uint8_t)LED_OWNER_NONE) && !patterns_active()) {
+        cur_owner = (uint8_t)LED_OWNER_NONE;
+    }
 }
 
 uint32_t led_ticks_until_next(void)
@@ -1439,12 +1538,10 @@ void led_toggle(uint8_t id)
         return;
     }
     LED_ENTER_CRITICAL();
-    /* Переключение по фактическому уровню вывода, а не по режиму. */
-    if (out_level[id] > 0u) {
-        set_mode_off(id);
-    } else {
-        set_mode_on(id);
-    }
+    /* Переключение по фактическому уровню вывода, а не по режиму.
+     * Единый вызов set_mode_level() — вместо ветви на set_mode_off/set_mode_on:
+     * это даёт обычный хвостовой вызов без save/restore кадра. */
+    set_mode_level(id, (uint8_t)(out_level[id] == 0u));
     LED_EXIT_CRITICAL();
 }
 
@@ -1490,7 +1587,9 @@ void led_play(uint8_t id, const led_sequence_t *seq)
 
 void led_flash_and_fade(uint8_t count)
 {
-    uint8_t i;
+    led_state_t *s = leds;
+    uint16_t      t;
+    uint8_t       i;
 
     if (count == 0 || count > LED_COUNT) {
         return;
@@ -1500,12 +1599,17 @@ void led_flash_and_fade(uint8_t count)
 #if LED_USE_EFFECTS
     stop_effect_inner();
 #endif
-    for (i = count; i < LED_COUNT; i++) {
+    for (i = count; i < LED_COUNT; i++, s++) {
         set_mode_off(i);
     }
-    /* LED[count-1] гаснет первым (60 тиков), LED[0] — последним. */
-    for (i = 0; i < count; i++) {
-        on_for_locked(i, (uint16_t)(60u + (uint16_t)(count - 1u - i) * 10u));
+    /* LED[count-1] гаснет первым (60 тиков), LED[0] — последним.
+     * Длительность убывает на 10 тиков за шаг, поэтому она считается
+     * вычитанием из одного стартового значения, а не умножением
+     * (count-1-i)*10 в каждой итерации. */
+    t = (uint16_t)(50u + (uint16_t)count * 10u);
+    for (i = 0; i < count; i++, s++) {
+        on_for_locked(i, t);
+        t = (uint16_t)(t - 10u);
     }
     LED_EXIT_CRITICAL();
 }
@@ -1596,15 +1700,10 @@ void led_release(led_owner_t owner)
  */
 static void stop_all_patterns(void)
 {
-    uint8_t i;
-
     /* LED_MODE_OFF = 0 и LED_MODE_ON = 1, все паттернные режимы — от 2
-     * и выше, поэтому «таймерный» канал отличается одним сравнением. */
-    for (i = 0; i < LED_COUNT; i++) {
-        if (leds[i].mode > (uint8_t)LED_MODE_ON) {
-            set_mode_off(i);
-        }
-    }
+     * и выше, поэтому «таймерный» канал отличается одним сравнением.
+     * Общий off_by_mode() не даёт третьей копии тела цикла. */
+    (void)off_by_mode((uint8_t)((uint8_t)LED_MODE_ON + 1u), true);
 #if LED_USE_EFFECTS
     stop_effect_inner();
 #endif
@@ -1748,15 +1847,15 @@ uint8_t led_get_level(uint8_t id)
 
 uint8_t led_any_led_active(void)
 {
-    uint8_t i;
-    uint8_t active = 0;
+    led_state_t *s = leds;
+    uint8_t      active = 0;
 
     LED_ENTER_CRITICAL();
-    for (i = 0; i < LED_COUNT; i++) {
-        if (leds[i].mode == LED_MODE_ON_FOR ||
-            leds[i].mode == LED_MODE_BLINK ||
-            leds[i].mode == LED_MODE_SEQUENCE ||
-            leds[i].mode == LED_MODE_EFFECT) {
+    for (; s < &leds[LED_COUNT]; s++) {
+        if (s->mode == LED_MODE_ON_FOR ||
+            s->mode == LED_MODE_BLINK ||
+            s->mode == LED_MODE_SEQUENCE ||
+            s->mode == LED_MODE_EFFECT) {
             active = 1;
             break;
         }

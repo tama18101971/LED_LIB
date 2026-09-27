@@ -89,6 +89,24 @@ plus a `-pedantic-errors` check and the CH32V003 firmware build.
   change"; `0` means "no timed mode". `next_change_ticks()`, `idle_ticks()`
   and `tick_one()` therefore need no switch on the mode — a mode switch in
   these hot paths costs ~100 B of flash. Keep it that way.
+- **Index `leds[]` only in the public API; use pointers inside.** A per-channel
+  struct is 20 B, so `leds[id]` costs `slli/add/slli` and a reload of the
+  array base after every call that may clobber registers. Mutators and scan
+  loops take `led_state_t *s` instead. Measured: removing the base spill
+  inside the scan loops was worth ~10 B each.
+- **One shared "switch channels off by mode" loop.** `packed_reset()`,
+  `stop_effect_inner()` and `stop_all_patterns()` all walk `leds[]` calling
+  `set_mode_off()`. They use `off_by_mode(mode, or_higher)`; do not
+  re-introduce a private copy of that loop.
+- **Ownership is dropped in two different shapes on purpose.** On the
+  `LED_TICKS_FOREVER` exit `led_advance()` stores `LED_OWNER_NONE`
+  unconditionally (one store, no rescan of the channels); on the
+  ticks-exhausted exit it must call `patterns_active()`. Folding both into
+  one helper with a flag makes GCC expand the check three times and grows
+  `led_advance()`.
+- `eff_period[]` is `uint8_t`, not `uint16_t` — the largest entry is 145 at
+  `LED_COUNT = 8`. The `LED_SA(...)` guards next to it must stay: they turn a
+  future period overflow into a build error instead of a silent wrap.
 - `LED_M_PHASE` (BLINK phase) and `LED_M_LOOP` (SEQUENCE) live in the spare
   bits of `mode`; there is no separate `flags` field. `led_get_mode()` must
   mask them off with `LED_M_MODE`.
@@ -101,6 +119,8 @@ plus a `-pedantic-errors` check and the CH32V003 firmware build.
   (`pc_one_word`); do not add a second code path.
 - The packed decoder uses shifts only: `pc_level()`/`pc_time()` decode both
   phases from one expression, `duration = win << (2 * shift)`.
+- The library must stay clean under `-Wall -Wextra -Wconversion -Wpedantic
+  -Werror`; watch the `uint8_t -> int` promotion in mask shifts.
 
 ## Key conventions
 
@@ -170,11 +190,20 @@ Library contribution = build with the library minus the same build without it.
 | 1 channel, plan subset (+sequences, +events) | 1620 B | 60 B |
 | 1 channel, sequences only | 792 B | 28 B |
 | 4 channels, everything on | 2660 B | 124 B |
-| Demo firmware total (SDK + library) | 4116 B | 412 B |
+| Demo firmware total (SDK + library) | 3968 B | 412 B |
+| Rates firmware total (SDK + library) | 3376 B | 408 B |
+
+`led.o` compiled standalone (4 channels, everything on): **3589 B** text,
+4 B data, 122 B bss. Before the 3.0.1 size pass it was 3744 B — the whole
+optimization pass below is worth ~155 B of the object.
 
 Derived: core ≈ 660 B, packed-command module ≈ 580 B, sequences module
 ≈ 130 B. Per-channel state: 10 B without sequences, 20 B with; packed
 FSM state: 21 B regardless of LED_COUNT.
+
+> The per-configuration rows are only refreshed when the paired
+> with/without-library build is actually re-run. Re-measure before quoting
+> them; do not extrapolate from `led.o` size.
 
 Keep these numbers in check when touching the core; measure with `pio run` +
 `riscv-wch-elf-nm` (or a paired "with/without library" build, which is the only
