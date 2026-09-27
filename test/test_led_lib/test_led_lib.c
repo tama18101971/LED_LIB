@@ -73,26 +73,61 @@ static int checks_total;
 #endif
 
 /* ------------------------------------------------------------------ */
-/*  Мок GPIO                                                           */
+/*  Мок вывода: уровни + журнал вызовов                                 */
 /* ------------------------------------------------------------------ */
 
-static unsigned char phys;      /* физическое состояние выводов */
-static unsigned      gpio_calls;
+/** Физические уровни выводов (0 = гас, 1..LED_LEVEL_MAX = «горит»). */
+static uint8_t phys_level[LED_COUNT];
+static unsigned gpio_calls;
 
-static void mock_gpio(uint8_t id, bool state)
+/** Журнал вызовов callback — для сравнения потоков (инвариант advance). */
+#define LOG_MAX 8192
+static uint8_t  log_id[LOG_MAX];
+static uint8_t  log_lvl[LOG_MAX];
+static unsigned log_len;
+static int      log_overflow;
+
+static void mock_gpio(uint8_t id, uint8_t level)
 {
-    uint8_t bit = (uint8_t)(1u << id);
-
     gpio_calls++;
-    phys = state ? (uint8_t)(phys | bit) : (uint8_t)(phys & (uint8_t)~bit);
+    if (id < LED_COUNT) {
+        phys_level[id] = level;
+    }
+    if (log_len < LOG_MAX) {
+        log_id[log_len] = id;
+        log_lvl[log_len] = level;
+        log_len++;
+    } else {
+        log_overflow = 1;
+    }
+}
+
+/** Битовая маска «горящих» каналов — для старых тестов эффектов. */
+static unsigned char phys_mask(void)
+{
+    unsigned char m = 0;
+    uint8_t i;
+
+    for (i = 0; i < LED_COUNT; i++) {
+        if (phys_level[i] > 0u) {
+            m = (unsigned char)(m | (1u << i));
+        }
+    }
+    return m;
 }
 
 static void reset_mock(void)
 {
     led_init();
     led_set_callback(mock_gpio);
-    phys = 0;
-    gpio_calls = 0;
+    for (log_len = 0; log_len < LOG_MAX; log_len++) {
+        log_id[log_len] = 0;
+        log_lvl[log_len] = 0;
+    }
+    log_len      = 0;
+    log_overflow = 0;
+    gpio_calls   = 0;
+    memset(phys_level, 0, sizeof(phys_level));
 }
 
 static void run(unsigned n)
@@ -103,6 +138,47 @@ static void run(unsigned n)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Тестовые фикстуры                                                  */
+/* ------------------------------------------------------------------ */
+
+#if LED_USE_SEQUENCES
+static const led_step_t seq_steps[] = {
+    LED_STEP_LVL(2, 2),   /* уровень 2 на 2 тика */
+    LED_STEP_OFF(3),      /* гашение на 3 тика    */
+    LED_STEP_ON(1)        /* вспышка на 1 тик     */
+};
+static const led_sequence_t seq_once = LED_SEQ(seq_steps);
+static const led_sequence_t seq_loop = LED_SEQ_LOOP(seq_steps);
+
+/* Ведущий шаг OFF = «стартовать через N тиков» (отдельного API нет). */
+static const led_step_t delay_steps[] = {
+    LED_STEP_OFF(4),
+    LED_STEP_ON(2),
+    LED_STEP_OFF(1)
+};
+static const led_sequence_t delay_seq = LED_SEQ(delay_steps);
+#endif
+
+#if LED_USE_PACKED_COMMANDS
+/* «3 коротких вспышки 15/60 тиков на уровне 1» — эталон из ТЗ. */
+static const uint32_t pk_err[]  = { LED_CMD(1u, 3u, 15u, 60u, 1u, 0u) };
+static const uint32_t pk_cmd[]  = { LED_CMD(1u, 1u, 4u, 6u, 2u, 0u) };
+static const uint32_t pk_stop[] = { LED_CMD(1u, 1u, 4u, 6u, 2u, 0u), LED_SYS_STOP };
+static const uint32_t pk_rep2[] = { LED_CMD(1u, 1u, 4u, 6u, 2u, 0u),
+                                    LED_SYS_REP_AT(2u) };
+static const uint32_t pk_inf[]  = { LED_CMD(1u, 1u, 4u, 6u, 2u, 0u),
+                                    LED_SYS_REP_START };
+/* Вырожденная таблица: все фазы нулевые + бесконечный повтор. */
+static const uint32_t pk_spin[] = { LED_CMD(1u, 15u, 0u, 0u, 1u, 0u),
+                                    LED_SYS_REP_START };
+/* Таблица из одних системных команд: guard обязан погасить её сразу. */
+static const uint32_t pk_sys[]  = { LED_SYS_REP_START };
+/* Две команды подряд, без явной границы -> STOP по умолчанию. */
+static const uint32_t pk_two[]  = { LED_CMD(1u, 2u, 2u, 3u, 1u, 0u),
+                                    LED_CMD(1u, 1u, 5u, 4u, 1u, 0u) };
+#endif
+
+/* ------------------------------------------------------------------ */
 /*  Тесты: ручные режимы                                               */
 /* ------------------------------------------------------------------ */
 
@@ -111,10 +187,13 @@ static void test_init_and_queries(void)
     reset_mock();
     CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
     CHECK_EQ(led_is_on(0), 0);
+    CHECK_EQ(led_get_level(0), 0);
     CHECK_EQ(led_any_led_active(), 0);
+    CHECK_EQ(led_pattern_active(), 0);
     led_on(0);
     CHECK_EQ(led_get_mode(0), LED_MODE_ON);
     CHECK_EQ(led_is_on(0), 1);
+    CHECK_EQ(led_get_level(0), 1);
     CHECK_EQ(led_any_led_active(), 0);   /* ON — статичный режим */
     led_off(0);
     CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
@@ -124,15 +203,18 @@ static void test_init_and_queries(void)
     led_toggle((uint8_t)LED_COUNT);
     led_on_for((uint8_t)LED_COUNT, 5);
     led_blink((uint8_t)LED_COUNT, 1, 1);
+    led_blink_level((uint8_t)LED_COUNT, 1, 1, 0, 1);
+    led_set_level((uint8_t)LED_COUNT, 2);
     CHECK_EQ(led_get_mode((uint8_t)LED_COUNT), LED_MODE_OFF);
     CHECK_EQ(led_is_on((uint8_t)LED_COUNT), 0);
+    CHECK_EQ(led_get_level((uint8_t)LED_COUNT), 0);
 }
 
 static void test_on_off_toggle(void)
 {
     uint8_t id1 = (LED_COUNT > 1) ? 1u : 0u;
 
-    /* led_toggle работает по фактическому состоянию вывода. */
+    /* led_toggle работает по фактическому уровню вывода. */
     reset_mock();
     led_on_for(0, 100);
     run(1);
@@ -140,7 +222,7 @@ static void test_on_off_toggle(void)
     led_toggle(0);                       /* горит -> погаснет */
     run(200);
     CHECK_EQ(led_is_on(0), 0);
-    CHECK_EQ(phys, 0);
+    CHECK_EQ(phys_mask(), 0);
     led_toggle(0);                       /* погас -> загорится */
     run(1);
     CHECK_EQ(led_is_on(0), 1);
@@ -165,7 +247,7 @@ static void test_on_for_timing(void)
     for (i = 0; i < 10; i++) {
         /* Сэмплируем до led_process: считаем тиковые интервалы,
          * в течение которых вывод был в активном уровне. */
-        if (phys & 1u) {
+        if (phys_level[0] > 0u) {
             on++;
         }
         led_process();
@@ -188,7 +270,7 @@ static void test_blink(void)
     led_blink(0, 3, 7);
     for (i = 0; i < 100; i++) {
         led_process();
-        if (phys & 1u) {
+        if (phys_level[0] > 0u) {
             on++;
         } else {
             off++;
@@ -208,45 +290,60 @@ static void test_blink(void)
 #if LED_USE_SEQUENCES
 static void test_sequence(void)
 {
-    static const led_step_t steps[] = { LED_STEP_ON(2), LED_STEP_OFF(3) };
-    static const led_sequence_t once = { steps, 2, false };
-    static const led_sequence_t loop = { steps, 2, true };
-    unsigned i;
     char buf[21];
 
-    /* Однократно: ON 2 тика, OFF 3, затем STOP. */
+    /* Однократно: уровень 2 два тика, гашение 3, вспышка 1, затем STOP. */
     reset_mock();
-    led_play(0, &once);
-    for (i = 0; i < 12; i++) {
-        buf[i] = (phys & 1u) ? '#' : '.';
-        led_process();
+    led_play(0, &seq_once);
+    {
+        unsigned i;
+
+        for (i = 0; i < 12; i++) {
+            buf[i] = (phys_level[0] > 0u) ? '#' : '.';
+            led_process();
+        }
+        buf[12] = '\0';
     }
-    buf[12] = '\0';
-    CHECK(strcmp(buf, "##..........") == 0);
+    CHECK(strcmp(buf, "##...#......") == 0);
     CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
 
-    /* Зациклено: период 5 тиков. */
+    /* Зациклено: период 6 тиков, три периода подряд. */
     reset_mock();
-    led_play(0, &loop);
-    for (i = 0; i < 20; i++) {
-        buf[i] = (phys & 1u) ? '#' : '.';
-        led_process();
+    led_play(0, &seq_loop);
+    {
+        unsigned i, t = 0, k;
+
+        for (k = 0; k < 3u; k++) {
+            buf[t++] = '#';
+            buf[t++] = '#';
+            buf[t++] = '.';
+            buf[t++] = '.';
+            buf[t++] = '.';
+            buf[t++] = '#';
+        }
+        buf[t] = '\0';
+        for (i = 0; i < t; i++) {
+            if (buf[i] != ((phys_level[0] > 0u) ? '#' : '.')) {
+                buf[i] = '?';
+            }
+            led_process();
+        }
+        CHECK(strcmp(buf, "##...###...###...#") == 0);
     }
-    buf[20] = '\0';
-    CHECK(strcmp(buf, "##...##...##...##...") == 0);
     CHECK_EQ(led_get_mode(0), LED_MODE_SEQUENCE);
 
-    /* Шаг с ticks == 0 длится 1 тик; зависаний нет. */
+    /* Шаги нулевой длительности живут 1 тик; зависаний нет. */
     {
         static const led_step_t zs[] = {
             LED_STEP_ON(0), LED_STEP_OFF(0), LED_STEP_ON(3)
         };
-        static const led_sequence_t zseq = { zs, 3, false };
+        static const led_sequence_t zseq = LED_SEQ(zs);
+        unsigned i;
 
         reset_mock();
         led_play(0, &zseq);
         for (i = 0; i < 12; i++) {
-            buf[i] = (phys & 1u) ? '#' : '.';
+            buf[i] = (phys_level[0] > 0u) ? '#' : '.';
             led_process();
         }
         buf[12] = '\0';
@@ -268,10 +365,452 @@ static void test_sequence(void)
         CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
     }
 }
+
+/* R4: стартовая задержка = ведущий шаг LED_STEP_OFF(n). */
+static void test_leading_off_step(void)
+{
+    char buf[16];
+
+    reset_mock();
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+    CHECK_EQ(led_get_level(0), 0);
+    led_play(0, &delay_seq);
+    /* Первый шаг применён немедленно, но это 0: выход не «съеден»,
+     * задержка реально длится 4 тика. */
+    CHECK_EQ(led_get_level(0), 0);
+    {
+        unsigned i;
+
+        for (i = 0; i < 8; i++) {
+            buf[i] = (phys_level[0] > 0u) ? '#' : '.';
+            led_process();
+        }
+        buf[8] = '\0';
+    }
+    CHECK(strcmp(buf, "....##..") == 0);
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+}
 #endif
 
 /* ------------------------------------------------------------------ */
-/*  Тесты: эффекты                                                     */
+/*  R2: уровневый выход                                               */
+/* ------------------------------------------------------------------ */
+
+static void test_levels(void)
+{
+    /* Статический уровень — основной API аналогового канала. */
+    reset_mock();
+    led_set_level(0, 3u);
+    CHECK_EQ(led_get_level(0), 3);
+    CHECK_EQ(led_is_on(0), 1);
+    CHECK_EQ(led_get_mode(0), LED_MODE_ON);
+    run(5);
+    CHECK_EQ(led_get_level(0), 3);   /* уровень держится, а не мигает */
+    led_off(0);
+    CHECK_EQ(led_get_level(0), 0);
+    CHECK_EQ(led_is_on(0), 0);
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+    led_on(0);
+    CHECK_EQ(led_get_level(0), 1);
+
+    /* led_toggle работает по «уровень > 0», а не по 1. */
+    led_set_level(0, 5u);
+    led_toggle(0);
+    CHECK_EQ(led_get_level(0), 0);
+    led_toggle(0);
+    CHECK_EQ(led_get_level(0), 1);
+
+    /* led_blink_level: произвольные уровни фаз (сэмпл ПОСЛЕ advance). */
+    reset_mock();
+    led_blink_level(0, 4u, 2u, 0u, 3u);
+    {
+        uint8_t seen[5];
+        unsigned k;
+
+        for (k = 0; k < 5u; k++) {
+            led_advance(1u);
+            seen[k] = phys_level[0];
+        }
+        CHECK_EQ(seen[0], 4);
+        CHECK_EQ(seen[1], 4);
+        CHECK_EQ(seen[2], 0);
+        CHECK_EQ(seen[3], 0);
+        CHECK_EQ(seen[4], 0);
+    }
+    /* led_blink — обёртка над уровнями 1/0: 2 тика вкл, 2 тика выкл. */
+    reset_mock();
+    led_blink(0, 2u, 2u);
+    run(2);
+    CHECK_EQ(led_get_level(0), 1);
+    run(2);
+    CHECK_EQ(led_get_level(0), 0);
+    run(2);
+    CHECK_EQ(led_get_level(0), 1);
+
+    /* Нулевые фазы -> OFF, как и у led_blink. */
+    led_blink_level(0, 4u, 0u, 0u, 3u);
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+    led_blink_level(0, 4u, 2u, 0u, 0u);
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+
+    /* led_get_level() отражает состояние и без callback'а. */
+    reset_mock();
+    led_set_callback(NULL);
+    led_set_level(0, 6u);
+    CHECK_EQ(led_get_level(0), 6);
+    CHECK_EQ(led_is_on(0), 1);
+    led_set_callback(mock_gpio);
+    run(1);
+    CHECK_EQ(phys_level[0], 6);
+}
+
+#if LED_USE_SEQUENCES
+/* Уровневые шаги последовательности. */
+static void test_sequence_levels(void)
+{
+    static const led_step_t lv[] = {
+        LED_STEP_LVL(1, 1), LED_STEP_LVL(3, 2), LED_STEP_LVL(7, 1), LED_STEP_OFF(1)
+    };
+    static const led_sequence_t sq = LED_SEQ(lv);
+    char buf[8];
+
+    reset_mock();
+    led_play(0, &sq);
+    buf[0] = (char)('0' + phys_level[0]);
+    led_process();
+    buf[1] = (char)('0' + phys_level[0]);
+    led_process();
+    buf[2] = (char)('0' + phys_level[0]);
+    led_process();
+    buf[3] = (char)('0' + phys_level[0]);
+    led_process();
+    buf[4] = (char)('0' + phys_level[0]);
+    buf[5] = '\0';
+    CHECK(strcmp(buf, "13370") == 0);
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  R1: событийное продвижение времени                                 */
+/* ------------------------------------------------------------------ */
+
+/** Набор сценариев для проверки инварианта advance(1)xN == advance(N). */
+enum {
+    TC_STATIC = 0,
+    TC_ON_FOR,
+    TC_BLINK,
+    TC_BLINK_LEVEL,
+    TC_SEQ,
+    TC_EFFECT,
+    TC_PACKED,
+    TC_COUNT_CASES
+};
+
+static void setup_case(int c)
+{
+    switch (c) {
+        case TC_STATIC:
+            led_set_level(0, 3u);
+            break;
+        case TC_ON_FOR:
+            led_on_for(0, 7u);
+            break;
+        case TC_BLINK:
+            led_blink(0, 3u, 5u);
+            break;
+        case TC_BLINK_LEVEL:
+            led_blink_level(0, 4u, 3u, 1u, 5u);
+            break;
+#if LED_USE_SEQUENCES
+        case TC_SEQ:
+            led_play(0, &seq_loop);
+            break;
+#endif
+#if TEST_EFFECT != LED_EFFECT_NONE
+        case TC_EFFECT:
+            led_start_effect(TEST_EFFECT);
+            break;
+#endif
+#if LED_USE_PACKED_COMMANDS
+        case TC_PACKED:
+            led_packed_run(pk_err, LED_ARRAY_LEN(pk_err));
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+static int case_enabled(int c)
+{
+    switch (c) {
+#if !LED_USE_SEQUENCES
+        case TC_SEQ:
+            return 0;
+#endif
+#if TEST_EFFECT == LED_EFFECT_NONE
+        case TC_EFFECT:
+            return 0;
+#endif
+#if !LED_USE_PACKED_COMMANDS
+        case TC_PACKED:
+            return 0;
+#endif
+        default:
+            return 1;
+    }
+}
+
+static void log_copy(uint8_t *ids, uint8_t *lvls, unsigned *len)
+{
+    *len = log_len;
+    memcpy(ids, log_id, (size_t)(log_len * sizeof(uint8_t)));
+    memcpy(lvls, log_lvl, (size_t)(log_len * sizeof(uint8_t)));
+}
+
+/** R1: led_advance(1) x N тождественно led_advance(N). */
+static void test_advance_invariant(void)
+{
+    static uint8_t ida[LOG_MAX], lvla[LOG_MAX], idb[LOG_MAX], lvlb[LOG_MAX];
+    static uint8_t pa[LED_COUNT], pb[LED_COUNT];
+    const unsigned n = 200u;
+    int c;
+
+    for (c = 0; c < TC_COUNT_CASES; c++) {
+        unsigned la, lb, t;
+        int same;
+
+        if (!case_enabled(c)) {
+            continue;
+        }
+
+        /* Поток A: тик за тиком. */
+        reset_mock();
+        setup_case(c);
+        for (t = 0; t < n; t++) {
+            led_advance(1u);
+        }
+        log_copy(ida, lvla, &la);
+        memcpy(pa, phys_level, sizeof(pa));
+
+        /* Поток B: одним вызовом. */
+        reset_mock();
+        setup_case(c);
+        led_advance(n);
+        log_copy(idb, lvlb, &lb);
+        memcpy(pb, phys_level, sizeof(pb));
+
+        CHECK(!log_overflow);
+        CHECK_EQ(la, lb);
+        same = (memcmp(ida, idb, (size_t)(la * sizeof(uint8_t))) == 0) &&
+               (memcmp(lvla, lvlb, (size_t)(la * sizeof(uint8_t))) == 0);
+        if (!same) {
+            unsigned k;
+
+            for (k = 0; k < la && k < lb; k++) {
+                if (ida[k] != idb[k] || lvla[k] != lvlb[k]) {
+                    printf("  case %d: first divergence at call %u: "
+                           "(%u,%u) vs (%u,%u)\n", c, k,
+                           ida[k], lvla[k], idb[k], lvlb[k]);
+                    break;
+                }
+            }
+        }
+        CHECK(same);
+        CHECK(memcmp(pa, pb, sizeof(pa)) == 0);
+    }
+}
+
+/** R1: ноль тиков — полный no-op. */
+static void test_advance_zero(void)
+{
+    unsigned before;
+
+    reset_mock();
+    led_blink(0, 3u, 5u);
+    run(1);
+    before = log_len;
+    led_advance(0);
+    CHECK_EQ(log_len, before);
+}
+
+/**
+ * R1: длинные таймеры и пакетное продвижение сильно больше счётчика.
+ * Здесь работает ограничение «один промах не длиннее 0xFFFE тиков»
+ * (счётчики каналов — uint16_t) и кодирование больших длительностей
+ * в упакованных командах.
+ */
+static void test_advance_long(void)
+{
+    reset_mock();
+    led_on_for(0, 0xFFFFu);
+    CHECK_EQ(led_ticks_until_next(), 0xFFFF);
+    led_advance(0xFFFEu);
+    CHECK_EQ(led_get_level(0), 1);
+    led_advance(1u);                 /* ровно на последнем тике -> OFF */
+    CHECK_EQ(led_get_level(0), 0);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Пакет сильно длиннее паттерна. */
+    reset_mock();
+    led_on_for(0, 3u);
+    led_advance(100000u);
+    CHECK_EQ(led_get_level(0), 0);
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_ticks_until_next(), (long)LED_TICKS_FOREVER);
+
+#if LED_USE_PACKED_COMMANDS
+    /* Длительность 258048 тиков = 63 * 4^6 (верхняя граница shift=6). */
+    reset_mock();
+    led_packed_once(LED_CMD(1u, 1u, 258048u, 0u, 1u, 0u));
+    CHECK_EQ(led_ticks_until_next(), 258048);
+    led_advance(258047u);
+    CHECK_EQ(led_get_level(0), 1);
+    led_advance(1u);
+    CHECK_EQ(led_get_level(0), 0);      /* t1 == 0: переход на этом же тике */
+    led_advance(1u);
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_get_level(0), 0);
+#endif
+}
+
+/** R1: тик до следующего изменения никогда не равен нулю. */
+static void test_ticks_until_next(void)
+{
+    static uint8_t ida[LOG_MAX], lvla[LOG_MAX], idb[LOG_MAX], lvlb[LOG_MAX];
+    static uint8_t pa[LED_COUNT], pb[LED_COUNT];
+    const unsigned n = 200u;
+    int c;
+
+    /* Ничего не запущено -> изменений не будет. */
+    reset_mock();
+    CHECK_EQ(led_ticks_until_next(), (long)LED_TICKS_FOREVER);
+    led_blink(0, 4u, 4u);
+    led_advance(1u);
+    CHECK_EQ(led_ticks_until_next(), 3);   /* остаток ON-фазы 4-1 */
+    led_advance(2u);
+    CHECK_EQ(led_ticks_until_next(), 1);   /* последний тик ON-фазы */
+
+    for (c = 0; c < TC_COUNT_CASES; c++) {
+        unsigned la, lb, t;
+        int same, bad = 0;
+
+        if (!case_enabled(c)) {
+            continue;
+        }
+
+        /* Опорный поток: тик за тиком. */
+        reset_mock();
+        setup_case(c);
+        for (t = 0; t < n; t++) {
+            led_advance(1u);
+        }
+        log_copy(ida, lvla, &la);
+        memcpy(pa, phys_level, sizeof(pa));
+
+        /* «Спящий хост»: спим ровно led_ticks_until_next() тиков,
+         * суммарно покрывая те же n тиков, что и опросный вариант. */
+        reset_mock();
+        setup_case(c);
+        {
+            unsigned advanced = 0;
+
+            while (advanced < n) {
+                uint32_t wait = led_ticks_until_next();
+
+                if (wait == (uint32_t)LED_TICKS_FOREVER) {
+                    /* Таймерных паттернов нет: время ничего не меняет.
+                     * advance(0) выполняет только синхронизацию выводов. */
+                    led_advance(0u);
+                    advanced = n;
+                    break;
+                }
+                if (wait == 0u) {
+                    bad = 1;          /* 0 недопустим по контракту API */
+                    break;
+                }
+                if (wait > (n - advanced)) {
+                    wait = (uint32_t)(n - advanced);
+                }
+                led_advance(wait);
+                advanced += (unsigned)wait;
+            }
+            if (advanced != n && bad == 0) {
+                bad = 3;              /* не сошлись с n тиками */
+            }
+        }
+        log_copy(idb, lvlb, &lb);
+        memcpy(pb, phys_level, sizeof(pb));
+
+        if (bad != 0) {
+            checks_total++;
+            checks_failed++;
+            printf("  FAIL sleeping-host case %d, err=%d\n", c, bad);
+        }
+        CHECK(!log_overflow);
+        CHECK_EQ(la, lb);
+        same = (memcmp(ida, idb, (size_t)(la * sizeof(uint8_t))) == 0) &&
+               (memcmp(lvla, lvlb, (size_t)(la * sizeof(uint8_t))) == 0);
+        CHECK(same);
+        CHECK(memcmp(pa, pb, sizeof(pa)) == 0);
+    }
+
+    /* Статические режимы: снать можно вечно. */
+    reset_mock();
+    led_set_level(0, 2u);
+    run(3);
+    CHECK_EQ(led_ticks_until_next(), (long)LED_TICKS_FOREVER);
+}
+
+/** R1/R6: сценарий сна с конечным числом пробуждений. */
+static void test_sleep_wake_sequence(void)
+{
+    static const uint32_t steps[] = { 0u, 1u, 1u, 4u, 2u, 1u, 10u, 0u, 0u };
+    static uint8_t stream[64];
+    static uint8_t expect[64];
+    unsigned t, k = 0, w;
+    int ok = 1;
+
+    reset_mock();
+    led_blink(0, 5u, 7u);
+    for (t = 0; t < 40u; t++) {
+        stream[t] = (uint8_t)(phys_level[0] > 0u ? 1u : 0u);
+        led_advance(1u);
+    }
+
+    reset_mock();
+    led_blink(0, 5u, 7u);
+    for (t = 0; t < 40u; t += w) {
+        w = led_ticks_until_next();
+        if (w == (uint32_t)LED_TICKS_FOREVER) {
+            w = 1u;
+        }
+        if (w == 0u) {
+            ok = 0;
+            break;
+        }
+        if (t + w > 40u) {
+            w = 40u - t;
+        }
+        /* Пробуждение: снимок состояния снаружи + переход внутрь. */
+        for (k = 0; k < w; k++) {
+            expect[t + k] = (uint8_t)(phys_level[0] > 0u ? 1u : 0u);
+            led_advance(1u);
+        }
+    }
+    CHECK(ok);
+    for (t = 0; t < 40u; t++) {
+        if (stream[t] != expect[t]) {
+            ok = 0;
+            break;
+        }
+    }
+    CHECK(ok);
+    (void)steps;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Эффекты (без изменений относительно 2.0, маска вместо уровня)      */
 /* ------------------------------------------------------------------ */
 
 #if LED_USE_EFFECTS
@@ -291,7 +830,7 @@ static void collect(led_effect_t e, unsigned ticks)
     }
     for (i = 0; i < ticks; i++) {
         led_process();
-        stream[i] = phys;
+        stream[i] = phys_mask();
     }
     stream_len = ticks;
 }
@@ -527,14 +1066,14 @@ static void test_random_reset(void)
     led_start_effect(LED_EFFECT_RANDOM_FLASH);
     for (i = 0; i < 8; i++) {
         led_process();
-        a[i] = phys;
+        a[i] = phys_mask();
     }
 
     reset_mock();   /* led_init() сбрасывает PRNG (регрессия M9) */
     led_start_effect(LED_EFFECT_RANDOM_FLASH);
     for (i = 0; i < 8; i++) {
         led_process();
-        b[i] = phys;
+        b[i] = phys_mask();
     }
     CHECK(memcmp(a, b, sizeof(a)) == 0);
 }
@@ -555,14 +1094,14 @@ static void test_effect_start_stop(void)
         led_start_effect(TEST_EFFECT);
         for (i = 0; i < 120; i++) {
             led_process();
-            a[i] = phys;
+            a[i] = phys_mask();
         }
 
         reset_mock();
         for (i = 0; i < 120; i++) {
             led_start_effect(TEST_EFFECT);   /* опросный вызов */
             led_process();
-            b[i] = phys;
+            b[i] = phys_mask();
         }
         CHECK(memcmp(a, b, 120) == 0);
     }
@@ -604,7 +1143,7 @@ static void test_effect_timer(void)
     run(5u * TEST_EFFECT_PERIOD + 1u);
     CHECK_EQ(led_effect_active(), 0);
     CHECK_EQ(led_effect_remaining(), 0);
-    CHECK_EQ(phys, 0);
+    CHECK_EQ(phys_mask(), 0);
 
     /* repeats = 0 -> бесконечно (LED_EFFECT_FOREVER). */
     reset_mock();
@@ -627,7 +1166,7 @@ static void test_effect_timer(void)
         for (i = 0; i < last_start + 11u; i++) {
             led_process();
             if (i >= last_start && i < last_start + 10u &&
-                phys == (uint8_t)(1u << (LED_COUNT - 1u))) {
+                phys_mask() == (uint8_t)(1u << (LED_COUNT - 1u))) {
                 high_last++;
             }
         }
@@ -660,7 +1199,6 @@ static void test_effect_timer(void)
 }
 #endif /* TEST_EFFECT != LED_EFFECT_NONE */
 
-#if LED_USE_EFFECTS
 static void test_flash_and_fade(void)
 {
     unsigned i, t_off[LED_COUNT];
@@ -675,7 +1213,7 @@ static void test_flash_and_fade(void)
 
         led_process();
         for (k = 0; k < LED_COUNT; k++) {
-            if (t_off[k] == 0 && ((phys & (uint8_t)(1u << k)) == 0)) {
+            if (t_off[k] == 0 && phys_level[k] == 0u) {
                 t_off[k] = i + 1u;
             }
         }
@@ -693,44 +1231,552 @@ static void test_flash_and_fade(void)
     led_flash_and_fade(0);
     led_flash_and_fade((uint8_t)(LED_COUNT + 1));
 }
-#endif
 
 #endif /* LED_USE_EFFECTS */
+
+/* ------------------------------------------------------------------ */
+/*  R5: упакованные команды                                           */
+/* ------------------------------------------------------------------ */
+
+#if LED_USE_PACKED_COMMANDS
+
+/*
+ * Статические проверки формата слова (та же гарантия, что в led.c).
+ * При компиляции как C11 используется _Static_assert, при строгом C99 —
+ * эквивалентный приём с массивом отрицательного размера (проверка
+ * выполняется на этапе компиляции в обоих случаях).
+ */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#  define T_SA(cond, tag) _Static_assert(cond, #tag)
+#else
+#  define T_SA(cond, tag) typedef char t_static_assert_##tag[(cond) ? 1 : -1]
+#endif
+T_SA(LED_CMD(0xFu, 0xFu, 1032192u, 1032192u, 7u, 7u) == 0xFFFFFFFFu, full_word);
+T_SA(LED_CMD_DEV(0x04780F31u)  == 1u,  golden_dev);
+T_SA(LED_CMD_COUNT(0x04780F31u) == 3u, golden_count);
+T_SA(LED_CMD_T0F(0x04780F31u)   == 15u, golden_t0);
+T_SA(LED_CMD_T1F(0x04780F31u)   == 60u, golden_t1);
+T_SA(LED_CMD_T0(0x04780F31u)    == 15u, golden_t0_ticks);
+T_SA(LED_CMD_T1(0x04780F31u)    == 60u, golden_t1_ticks);
+T_SA(LED_CMD_LVL0(0x04780F31u)  == 1u,  golden_l0);
+T_SA(LED_CMD_LVL1(0x04780F31u)  == 0u,  golden_l1);
+T_SA(0u == LED_SYS_STOP, zero_is_stop);
+T_SA(LED_CMD_IS_SYS(LED_SYS_REP_START) && !LED_CMD_IS_SYS(0x20u), sys_test);
+
+/** Собрать эталонную строку: 3 × (15 '#' + 60 '.') + хвост. */
+static void expected_err(char *out, unsigned rep_on, unsigned rep_off,
+                         unsigned tail)
+{
+    unsigned t = 0, k, i;
+
+    for (i = 0; i < 3u; i++) {
+        for (k = 0; k < rep_on; k++) {
+            out[t++] = '#';
+        }
+        for (k = 0; k < rep_off; k++) {
+            out[t++] = '.';
+        }
+    }
+    for (k = 0; k < tail; k++) {
+        out[t++] = '.';
+    }
+    out[t] = '\0';
+}
+
+static void test_packed_format(void)
+{
+    /* Round-trip: закодированное поле -> тики (значения, представимые
+     * точно: win * 4^shift при win = 1..63). */
+    static const uint32_t exact[] = { 1u, 2u, 63u, 64u, 100u, 252u,
+                                      1008u, 4032u, 16128u, 64512u, 258048u,
+                                      1032192u };
+    unsigned i;
+
+    for (i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
+        uint32_t w = LED_CMD(1u, 1u, exact[i], exact[i], 1u, 1u);
+
+        CHECK_EQ(LED_CMD_T0(w), exact[i]);
+        CHECK_EQ(LED_CMD_T1(w), exact[i]);
+        CHECK_EQ(LED_CMD_T0S(w), LED_CMD_T1S(w));
+        CHECK_EQ(LED_CMD_T0W(w), LED_CMD_T1W(w));
+    }
+
+    /* Вне диапазона — clamp к максимуму; 0 — «фаза без ожидания». */
+    CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, 5000000u, 0u, 1u, 1u)), 1032192u);
+    CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, 0u, 0u, 1u, 1u)), 0);
+    CHECK_EQ(LED_CMD_T1(LED_CMD(1u, 1u, 1u, 0u, 1u, 1u)), 0);
+
+    /* Граница точности: 6-битная мантисса при шаге 4^shift даёт
+     * относительную погрешность не хуже 1/32 (round-to-nearest; это
+     * теоретический предел для данного формата). На 1 тик снизу
+     * ошибки нет вовсе, значения до 63 тиков кодируются точно. */
+    for (i = 1; i < 5000u; i++) {
+        uint32_t enc = LED_CMD_T0(LED_CMD(1u, 1u, i, 0u, 1u, 1u));
+        unsigned diff = (unsigned)((enc > i) ? (enc - i) : (i - enc));
+
+        if (diff * 32u > i) {
+            printf("  encoding error at %u ticks: %lu (+/- %u)\n",
+                   i, (unsigned long)enc, diff);
+            CHECK(0);
+            break;
+        }
+    }
+    for (i = 1; i < 64u; i++) {
+        CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, i, 0u, 1u, 1u)), i);
+    }
+}
+
+static void test_packed_timing(void)
+{
+    char got[300], want[300];
+    unsigned i;
+
+    expected_err(want, 15u, 60u, 15u);
+
+    reset_mock();
+    led_packed_run(pk_err, LED_ARRAY_LEN(pk_err));
+    CHECK_EQ(led_pattern_active(), 1);
+    /* Первый тик фазы 0 отдан сразу, до него можно проспать t0 тиков. */
+    CHECK_EQ(led_ticks_until_next(), 15);
+    for (i = 0; i < 240u; i++) {
+        got[i] = (phys_level[0] > 0u) ? '#' : '.';
+        led_advance(1u);
+    }
+    got[240] = '\0';
+    CHECK(strcmp(got, want) == 0);
+    /* 3 × 75 = 225 тиков паттерна, дальше — остановка и тишина. */
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_ticks_until_next(), (long)LED_TICKS_FOREVER);
+    CHECK_EQ(led_get_level(0), 0);
+
+    /* То же через led_packed_once() — одиночная команда без массива. */
+    reset_mock();
+    led_packed_once(LED_CMD(1u, 2u, 3u, 4u, 5u, 0u));
+    CHECK_EQ(led_get_level(0), 5);
+    CHECK_EQ(led_ticks_until_next(), 3);
+    run(3);
+    CHECK_EQ(led_get_level(0), 0);
+    run(4);
+    CHECK_EQ(led_get_level(0), 5);
+    run(3);
+    CHECK_EQ(led_get_level(0), 0);
+    run(4);
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_get_level(0), 0);
+}
+
+/** Сколько раз «пара фаз» отработала: считаем фронты 0 -> level0. */
+static unsigned packed_pairs(uint32_t cmd)
+{
+    unsigned fronts = 0, t;
+    uint8_t prev;   /* до старта паттерна выход был погашен */
+
+    reset_mock();
+    led_packed_run(&cmd, 1u);
+    prev = 0u;
+    for (t = 0; t < 400u && led_pattern_active() != 0u; t++) {
+        led_advance(1u);
+        if (prev == 0u && phys_level[0] > 0u) {
+            fronts++;
+        }
+        prev = phys_level[0];
+    }
+    return fronts;
+}
+
+/** То же, но для массива: n тиков, подсчёт фронтов 0 -> «горит». */
+static unsigned packed_fronts(const uint32_t *cmds, unsigned n_cmds,
+                              unsigned ticks)
+{
+    unsigned fronts = 0, t;
+    uint8_t prev;
+
+    reset_mock();
+    led_packed_run(cmds, (uint16_t)n_cmds);
+    prev = 0u;
+    for (t = 0; t < ticks; t++) {
+        led_advance(1u);
+        if (prev == 0u && phys_level[0] > 0u) {
+            fronts++;
+        }
+        prev = phys_level[0];
+    }
+    return fronts;
+}
+
+static void test_packed_sys_commands(void)
+{
+    /* count = 1 -> одна пара фаз. */
+    CHECK_EQ(packed_pairs(pk_cmd[0]), 1u);
+    /* count = 15 -> бесконечно (считаем 400 тиков — 16+ пар). */
+    CHECK(packed_pairs(LED_CMD(1u, 15u, 1u, 1u, 1u, 0u)) > 10u);
+
+    /* Явный STOP на границе массива. */
+    reset_mock();
+    led_packed_run(pk_stop, LED_ARRAY_LEN(pk_stop));
+    run(50);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* REP_AT(2) -> команда выполняется 1 + 2 = 3 раза. */
+    CHECK_EQ(packed_fronts(pk_rep2, LED_ARRAY_LEN(pk_rep2), 200u), 3u);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* REP_START -> бесконечно, останавливается только led_packed_stop(). */
+    reset_mock();
+    led_packed_run(pk_inf, LED_ARRAY_LEN(pk_inf));
+    run(100);
+    CHECK_EQ(led_pattern_active(), 1);
+    CHECK(packed_fronts(pk_inf, LED_ARRAY_LEN(pk_inf), 100u) > 5u);
+    led_packed_stop();
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_get_level(0), 0);
+    run(50);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Нет явной границы -> STOP по умолчанию после двух команд:
+     * команда 1 (count=2) даёт 2 фронта, команда 2 (count=1) — ещё 1. */
+    CHECK_EQ(packed_fronts(pk_two, LED_ARRAY_LEN(pk_two), 100u), 3u);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Некорректные аргументы игнорируются. */
+    led_packed_run(NULL, 4u);
+    led_packed_run(pk_cmd, 0u);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Уже запущенный паттерн перезапускается, каналы гасятся. */
+    reset_mock();
+    led_packed_run(pk_inf, LED_ARRAY_LEN(pk_inf));
+    run(2);
+    CHECK(phys_level[0] > 0u);
+    led_packed_run(pk_cmd, LED_ARRAY_LEN(pk_cmd));
+    CHECK_EQ(led_get_level(0), 2);
+}
+
+static void test_packed_guard(void)
+{
+    /* Таблица из одних системных команд: guard обязан погасить её сразу,
+     * иначе бесконечный цикл внутри одного led_advance(). */
+    reset_mock();
+    led_packed_run(pk_sys, LED_ARRAY_LEN(pk_sys));
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Вырожденные фазы (t0 = t1 = 0) + REP_START: паттерн живёт, но
+     * advance() не зависает и не «пропускает» переходы — уровень
+     * чередуется каждый тик. */
+    reset_mock();
+    led_packed_run(pk_spin, LED_ARRAY_LEN(pk_spin));
+    CHECK_EQ(led_pattern_active(), 1);
+    {
+        unsigned t;
+        int alternates = 1;
+
+        for (t = 0; t < 50u; t++) {
+            uint8_t before = phys_level[0];
+
+            led_advance(1u);
+            if (phys_level[0] == before) {
+                alternates = 0;
+            }
+        }
+        CHECK(alternates);
+    }
+    led_packed_stop();
+    CHECK_EQ(led_pattern_active(), 0);
+}
+
+static void test_packed_device_mask(void)
+{
+    /* Старшие биты маски сверх LED_COUNT отсекаются, а не ломают выводы. */
+    uint32_t cmd = LED_CMD(0xFu, 1u, 2u, 2u, 1u, 0u);
+
+    reset_mock();
+    led_packed_once(cmd);
+    CHECK_EQ(led_get_mode(0), LED_MODE_PACKED);  /* канал забирается */
+    CHECK_EQ(led_get_level(0), 1);                 /* уровень фазы 0 */
+    run(2);
+    CHECK_EQ(led_get_level(0), 0);                 /* конец фазы 0 -> t1 */
+    run(2);
+    CHECK_EQ(led_pattern_active(), 0);
+    led_packed_stop();
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+    run(10);
+    CHECK_EQ(led_get_level(0), 0);
+
+#if LED_COUNT > 1
+    /* Каналы вне маски сохраняют свои паттерны. */
+    {
+        uint8_t  last  = (uint8_t)(LED_COUNT - 1u);
+        uint8_t  mask  = (uint8_t)((1u << (LED_COUNT - 1u)) - 1u);
+        uint32_t m_cmd = LED_CMD((uint32_t)mask, 1u, 2u, 2u, 1u, 0u);
+
+        CHECK(mask != 0u);
+        reset_mock();
+        led_blink(last, 2u, 2u);
+        led_packed_run(&m_cmd, 1u);
+        CHECK_EQ(led_get_mode(0), LED_MODE_PACKED);
+        CHECK_EQ(led_get_mode(last), LED_MODE_BLINK);
+        CHECK_EQ(led_get_level(last), 1);          /* свой паттерн жив */
+        led_packed_stop();
+        CHECK_EQ(led_get_mode(last), LED_MODE_BLINK);
+        CHECK_EQ(led_pattern_active(), 1);         /* blink продолжается */
+    }
+#endif
+
+    /* Per-LED вызов «оторвает» канал от паттерна: пакетное продвижение
+     * больше не возвращает ему уровень 0 (регрессия). */
+    reset_mock();
+    led_packed_run(pk_cmd, LED_ARRAY_LEN(pk_cmd));
+    run(4);
+    CHECK_EQ(led_get_level(0), 0);                /* конец фазы 0 */
+    led_blink(0, 2u, 2u);                          /* отрыв */
+    CHECK_EQ(led_get_mode(0), LED_MODE_BLINK);
+    led_advance(2u);
+    CHECK_EQ(led_get_level(0), 1);                /* свой паттерн жив */
+    CHECK_EQ(led_get_mode(0), LED_MODE_BLINK);
+    led_advance(100u);
+    CHECK_EQ(led_get_level(0), 1);                /* и не гасится пакетом */
+    CHECK_EQ(led_get_mode(0), LED_MODE_BLINK);
+}
+
+#endif /* LED_USE_PACKED_COMMANDS */
+
+/* ------------------------------------------------------------------ */
+/*  R3: владение индикатором                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_owner(void)
+{
+    /* Пусто из коробки. */
+    reset_mock();
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+    CHECK_EQ(led_stop_owner(LED_OWNER_BEACON), 0);
+    CHECK_EQ(led_stop_owner(LED_OWNER_NONE), 0);
+
+    /* Захват и снятие. */
+    led_set_owner(LED_OWNER_BEACON);
+    CHECK_EQ(led_claim(), LED_OWNER_BEACON);
+    led_release(LED_OWNER_WARNING);            /* не мой — игнор */
+    CHECK_EQ(led_claim(), LED_OWNER_BEACON);
+    led_release(LED_OWNER_BEACON);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+
+    /* Владение без паттерна снимается ближайшим advance(): индикатор
+     * свободен, пока не идёт ни один таймерный паттерн. */
+    led_set_owner(LED_OWNER_STROBE);
+    led_advance(10u);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+
+    /* Арбитраж: «это моё?» проверяется до запуска. */
+    reset_mock();
+    led_set_owner(LED_OWNER_BEACON);
+    led_on_for(0, 4u);
+    CHECK_EQ(led_claim(), LED_OWNER_BEACON);
+    CHECK_EQ(led_pattern_active(), 1);
+
+    /* После завершения паттерна владение снимается само. */
+    led_advance(5u);
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+
+    /* led_stop_owner() останавливает только «своё» и снимает владение. */
+    reset_mock();
+    led_set_owner(LED_OWNER_WARNING);
+    led_on_for(0, 100u);
+    CHECK_EQ(led_stop_owner(LED_OWNER_STROBE), 0);   /* не мой */
+    CHECK_EQ(led_claim(), LED_OWNER_WARNING);
+    CHECK_EQ(led_stop_owner(LED_OWNER_WARNING), 1);  /* мой */
+    CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
+    CHECK_EQ(led_get_level(0), 0);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+    CHECK_EQ(led_pattern_active(), 0);
+
+    /* Статичные режимы владение не отменяет: их задал хост вручную. */
+    reset_mock();
+    led_set_level(0, 4u);
+    led_set_owner(LED_OWNER_UI);
+    CHECK_EQ(led_stop_owner(LED_OWNER_UI), 1);
+    CHECK_EQ(led_get_level(0), 4);
+    CHECK_EQ(led_get_mode(0), LED_MODE_ON);
+
+    /* led_init() снимает владение. */
+    led_set_owner(LED_OWNER_UI);
+    led_init();
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+    led_set_callback(mock_gpio);
+
+#if LED_USE_EFFECTS
+    /* Остановка чужого эффекта. */
+    reset_mock();
+    led_set_owner(LED_OWNER_STROBE);
+#  if TEST_EFFECT != LED_EFFECT_NONE
+    led_start_effect(TEST_EFFECT);
+    CHECK_EQ(led_stop_owner(LED_OWNER_STROBE), 1);
+    CHECK_EQ(led_effect_active(), 0);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
+#  endif
+#endif
+#if LED_USE_PACKED_COMMANDS
+    /* Остановка чужого упакованного паттерна. */
+    reset_mock();
+    led_set_owner(LED_OWNER_BEACON);
+    led_packed_run(pk_inf, LED_ARRAY_LEN(pk_inf));
+    CHECK_EQ(led_stop_owner(LED_OWNER_BEACON), 1);
+    CHECK_EQ(led_pattern_active(), 0);
+    CHECK_EQ(led_get_level(0), 0);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/*  R6: события                                                        */
+/* ------------------------------------------------------------------ */
+
+#if LED_USE_EVENTS
+static unsigned ev_cycle, ev_end, ev_state;
+static uint32_t ev_arg;
+static uint8_t  ev_id;
+
+static void mock_event(uint8_t id, led_event_t ev, uint32_t arg)
+{
+    ev_id  = id;
+    ev_arg = arg;
+    if (ev == LED_EV_CYCLE_START) {
+        ev_cycle++;
+    } else if (ev == LED_EV_PATTERN_END) {
+        ev_end++;
+    } else if (id == 0) {
+        /* События уровня считаем только для канала 0: первый advance
+         * «дописал» бы состояния остальных каналов (led_init сбросил
+         * кэш выводов), и они не относятся к проверяемому паттерну. */
+        ev_state++;
+    }
+}
+
+static void ev_reset(void)
+{
+    ev_cycle = 0;
+    ev_end   = 0;
+    ev_state = 0;
+    ev_arg   = 0;
+    ev_id    = 0;
+    led_set_event_callback(mock_event);
+}
+
+static void test_events(void)
+{
+    /* ON_FOR: старт цикла и завершение паттерна. */
+    reset_mock();
+    ev_reset();
+    led_on_for(0, 3u);
+    CHECK_EQ(ev_cycle, 1);
+    CHECK_EQ(ev_id, 0);
+    led_advance(3u);
+    CHECK_EQ(ev_end, 1);
+    CHECK_EQ(ev_state, 2);      /* вкл на 1-м тике, выкл на 3-м */
+
+    /* BLINK: CYCLE_START на каждом круге (3 тика + 4 тика = 7). */
+    reset_mock();
+    ev_reset();
+    led_blink(0, 3u, 4u);
+    CHECK_EQ(ev_cycle, 1);
+    run(14);
+    CHECK_EQ(ev_cycle, 3);      /* старт + 2 круга */
+    led_blink_level(0, 2u, 3u, 0u, 4u);
+    CHECK_EQ(ev_cycle, 4);
+
+#if LED_USE_SEQUENCES
+    /* SEQUENCE: старт + каждый виток цикла. */
+    reset_mock();
+    ev_reset();
+    led_play(0, &seq_loop);     /* период 6 тиков */
+    CHECK_EQ(ev_cycle, 1);
+    run(12);
+    CHECK_EQ(ev_cycle, 3);
+    run(100);
+    CHECK_EQ(ev_end, 0);        /* зациклено: не завершается */
+    led_play(0, &seq_once);
+    run(10);
+    CHECK_EQ(ev_end, 1);
+#endif
+
+#if LED_USE_PACKED_COMMANDS
+    /* Упакованные команды: CYCLE_START на каждую загруженную команду,
+     * PATTERN_END по завершении. */
+    reset_mock();
+    ev_reset();
+    led_packed_run(pk_stop, LED_ARRAY_LEN(pk_stop));
+    CHECK_EQ(ev_cycle, 1);
+    run(30);
+    CHECK_EQ(ev_end, 1);
+    CHECK_EQ(ev_id, 0);
+#endif
+
+#if LED_USE_EFFECTS && (TEST_EFFECT != LED_EFFECT_NONE)
+    reset_mock();
+    ev_reset();
+    led_start_effect(TEST_EFFECT);
+    CHECK_EQ(ev_cycle, 1);
+    led_stop_effect();
+    CHECK_EQ(ev_end, 1);
+#endif
+
+    /* Уровень приходит в arg события состояния. */
+    reset_mock();
+    ev_reset();
+    ev_state = 0;
+    led_set_level(0, 6u);
+    CHECK_EQ(ev_state, 1);
+    CHECK_EQ(ev_arg, 6u);
+    CHECK_EQ(ev_id, 0);
+
+    /* Снятие callback'а. */
+    led_set_event_callback(NULL);
+    ev_state = 0;
+    led_set_level(0, 2u);
+    CHECK_EQ(ev_state, 0);
+}
+#endif /* LED_USE_EVENTS */
 
 /* ------------------------------------------------------------------ */
 /*  Тесты: инфраструктура                                              */
 /* ------------------------------------------------------------------ */
 
-static unsigned char phys2;
-static unsigned      calls2;
+static uint8_t  phys2;
+static unsigned calls2;
 
-static void mock_gpio2(uint8_t id, bool state)
+static void mock_gpio2(uint8_t id, uint8_t level)
 {
     (void)id;
-    (void)state;
+    if (level > phys2) {
+        phys2 = level;
+    }
     calls2++;
-    phys2 = 1;
 }
 
 static void test_gpio_cache_and_refresh(void)
 {
+    unsigned baseline;
+
     /* Кэш: без изменений - без вызовов callback. */
     reset_mock();
     led_on(0);
     run(50);
     CHECK(gpio_calls >= 1);
-    {
-        unsigned baseline = gpio_calls;
+    baseline = gpio_calls;
+    run(50);
+    CHECK_EQ(gpio_calls, baseline);   /* стабильный ON - ноль вызовов */
 
-        run(50);
-        CHECK_EQ(gpio_calls, baseline);   /* стабильный ON - ноль вызовов */
-    }
+    /* Смена уровня — ровно один вызов. */
+    led_set_level(0, 5u);
+    CHECK_EQ(gpio_calls, baseline + 1u);
 
     /* led_refresh() заставляет переписать все выводы (регрессия M7). */
-    phys = 0;   /* вывод «сбили» снаружи */
+    for (log_len = 0; log_len < LED_COUNT; log_len++) {
+        phys_level[log_len] = 0;
+    }
+    log_len = 0;
     led_refresh();
     run(1);
-    CHECK_EQ(phys, 0x01);
+    CHECK_EQ(phys_level[0], 5);
 
     /* Регрессия M6: новый callback получает полную картину состояния. */
     led_set_callback(NULL);
@@ -739,42 +1785,51 @@ static void test_gpio_cache_and_refresh(void)
     led_set_callback(mock_gpio2);
     run(1);
     CHECK(calls2 > 0);
-    CHECK_EQ(phys2, 1);
+    CHECK(phys2 > 0);
+    led_set_callback(mock_gpio);
 }
 
 static void test_reinit_keeps_callback(void)
 {
-    /* led_init() в 2.0 сохраняет callback и инвалидирует кэш:
+    /* led_init() в 2.0+ сохраняет callback и инвалидирует кэш:
      * первый тик гасит все выводы. */
     reset_mock();
     led_on(0);
     led_on((uint8_t)(LED_COUNT - 1u));
     run(2);
-    CHECK_EQ(phys, (unsigned)(0x01u | (1u << (LED_COUNT - 1u))));
+    CHECK_EQ(phys_mask(), (unsigned)(0x01u | (1u << (LED_COUNT - 1u))));
 
     led_init();          /* callback сохранён */
     run(1);
-    CHECK_EQ(phys, 0);   /* все диоды погашены */
+    CHECK_EQ(phys_mask(), 0);   /* все диоды погашены */
     led_on((uint8_t)(LED_COUNT > 1 ? 1u : 0u));
     run(1);
-    CHECK_EQ(phys, (unsigned)(1u << (LED_COUNT > 1 ? 1u : 0u)));
+    CHECK_EQ(phys_mask(), (unsigned)(1u << (LED_COUNT > 1 ? 1u : 0u)));
 }
 
 /* ------------------------------------------------------------------ */
 
 int main(void)
 {
-    printf("LED_LIB v%d.%d.%d host tests (LED_COUNT=%d)\n",
+    printf("LED_LIB v%d.%d.%d host tests (LED_COUNT=%d, packed=%d, events=%d)\n",
            LED_LIB_VERSION_MAJOR, LED_LIB_VERSION_MINOR, LED_LIB_VERSION_PATCH,
-           LED_COUNT);
+           LED_COUNT, LED_USE_PACKED_COMMANDS, LED_USE_EVENTS);
 
     test_init_and_queries();
     test_on_off_toggle();
     test_on_for_timing();
     test_blink();
+    test_levels();
 #if LED_USE_SEQUENCES
     test_sequence();
+    test_sequence_levels();
+    test_leading_off_step();
 #endif
+    test_advance_invariant();
+    test_advance_zero();
+    test_advance_long();
+    test_ticks_until_next();
+    test_sleep_wake_sequence();
 #if LED_USE_EFFECTS
 #if LED_USE_RUNNING_EFFECTS
     test_running_effects();
@@ -799,6 +1854,17 @@ int main(void)
     test_effect_timer();
 #endif
     test_flash_and_fade();
+#endif
+#if LED_USE_PACKED_COMMANDS
+    test_packed_format();
+    test_packed_timing();
+    test_packed_sys_commands();
+    test_packed_guard();
+    test_packed_device_mask();
+#endif
+    test_owner();
+#if LED_USE_EVENTS
+    test_events();
 #endif
     test_gpio_cache_and_refresh();
     test_reinit_keeps_callback();

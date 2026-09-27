@@ -5,7 +5,6 @@
 # (CH32V platform is community-maintained, installed from GitHub).
 # The native env exists only for `pio test -e native` (custom runner);
 # its own sources are the test suite, so it is not built by `pio run`.
-
 name: CI
 
 on:
@@ -52,6 +51,18 @@ jobs:
             name: no-random
           - config: '-DLED_USE_HOLD_EFFECTS=0'
             name: no-hold
+          - config: '-DLED_USE_PACKED_COMMANDS=0'
+            name: no-packed
+          - config: '-DLED_USE_EVENTS=1'
+            name: events
+          - config: '-DLED_USE_EVENTS=1 -DLED_USE_EFFECTS=0 -DLED_USE_SEQUENCES=0'
+            name: events-min
+          - config: '-DLED_USE_EFFECTS=0 -DLED_USE_SEQUENCES=0 -DLED_USE_PACKED_COMMANDS=1'
+            name: client-min
+          - config: '-DLED_LEVEL_MAX=1'
+            name: level1
+          - config: '-DLED_LEVEL_MAX=255'
+            name: level255
           - config: '-DLED_COUNT=8 -DLED_USE_SEQUENCES=0 -DLED_USE_RUNNING_EFFECTS=0'
             name: led8-trimmed
     steps:

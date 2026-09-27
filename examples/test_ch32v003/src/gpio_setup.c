@@ -34,11 +34,19 @@ void gpio_init_leds(void)
                            GPIO_Pin_6 | GPIO_Pin_7);
 }
 
-void led_hw_set(uint8_t id, bool state)
+/**
+ * Запись уровня в вывод: обычный GPIO-включатель.
+ *
+ * Уровень > 0 = «горит» (включаем пин), 0 = гасим. Если бы канал был
+ * аналоговым (DAC с N ступенями), здесь писался бы код из таблицы
+ * dac_code[level] — библиотека оперирует числами и ничего не знает
+ * про DAC.
+ */
+void led_hw_set(uint8_t id, uint8_t level)
 {
     if (id >= LED_COUNT) return;
 
-    if (state) {
+    if (level != 0u) {
         GPIO_SetBits(GPIOC, (uint16_t)(1UL << (4 + id)));
     } else {
         GPIO_ResetBits(GPIOC, (uint16_t)(1UL << (4 + id)));
