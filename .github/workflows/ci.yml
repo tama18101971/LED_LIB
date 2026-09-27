@@ -101,7 +101,7 @@ jobs:
           key: pio-ch32v003-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-ch32v003-
       - name: Build
-        run: pio run -e ch32v003
+        run: pio run
 
   native-pio:
     name: pio test -e native (custom runner)

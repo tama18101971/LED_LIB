@@ -287,6 +287,113 @@ static void test_blink(void)
     CHECK_EQ(led_get_mode(0), LED_MODE_OFF);
 }
 
+#if LED_COUNT >= 4
+/**
+ * Реальная задача с заказчика: четыре диода с разными частотами
+ * (1 раз в 4 с, 1 раз в 2 с, 1 раз в 1 с, 2 раза в 1 с) при тике 1 кГц.
+ * Это ровно то, что делает examples/rates_ch32v003.
+ *
+ * Проверяется ровно то, ради чего у каналов свои автоматы:
+ *   - периоды точны (число вспышек за 4 с = 1 / 2 / 4 / 8), накопления
+ *     ошибки от цикла к циклу нет;
+ *   - длительность вспышки равна заданной (проверяются и короткая
+ *     вспышка 100 мс, и скважность 50 % из примера);
+ *   - пакетный advance() (спящий хост) даёт тот же результат, что и
+ *     тик за тиком: таймеры uint16 не переполняются на длинном периоде,
+ *     потому что длинные промежутки проматываются кусками по 0xFFFE.
+ *
+ * @param duty50  true — скважность 50 % (как в примере), false — 100 мс.
+ */
+static void check_rates(bool duty50)
+{
+    static const uint16_t period[4]  = { 4000u, 2000u, 1000u, 500u };
+    static const unsigned  expect[4] = { 1u, 2u, 4u, 8u }; /* за 4 с */
+    unsigned fronts_tick[4]  = { 0u, 0u, 0u, 0u };
+    unsigned lit_tick[4]     = { 0u, 0u, 0u, 0u };
+    unsigned fronts_batch[4] = { 0u, 0u, 0u, 0u };
+    unsigned flash_at[4][5];                      /* тики первых вспышек */
+    uint8_t  was_on[4] = { 0u, 0u, 0u, 0u };
+    uint8_t  i;
+    unsigned k, f;
+
+    for (i = 0; i < 4; i++) {
+        for (f = 0; f < 5; f++) {
+            flash_at[i][f] = 0;
+        }
+    }
+
+    /* --- тик за тиком, 4.2 с (с запасом на последнюю вспышку) --- */
+    reset_mock();
+    for (i = 0; i < 4; i++) {
+        uint16_t half = (uint16_t)(period[i] / 2u);
+
+        led_blink(i, duty50 ? half : (uint16_t)100u,
+                 duty50 ? half : (uint16_t)(period[i] - 100u));
+    }
+    for (k = 0; k < 4200u; k++) {
+        led_advance(1u);
+        for (i = 0; i < 4; i++) {
+            uint8_t now = (phys_level[i] > 0u) ? 1u : 0u;
+
+            if ((now != 0u) && (was_on[i] == 0u)) {
+                if (fronts_tick[i] < 5u) {
+                    flash_at[i][fronts_tick[i]] = k + 1u;
+                }
+                if ((k + 1u) <= 4000u) {
+                    fronts_tick[i]++;    /* вспышка целиком в окне 4 с */
+                }
+            }
+            if ((now != 0u) && ((k + 1u) <= 4000u)) {
+                lit_tick[i]++;
+            }
+            was_on[i] = now;
+        }
+    }
+
+    /* --- пакетами по 10 мс: спящий хост с тиком 1 кГц --- */
+    reset_mock();
+    for (i = 0; i < 4; i++) {
+        uint16_t half = (uint16_t)(period[i] / 2u);
+
+        led_blink(i, duty50 ? half : (uint16_t)100u,
+                 duty50 ? half : (uint16_t)(period[i] - 100u));
+        was_on[i] = 0;
+    }
+    for (k = 0; k < 400u; k++) {
+        led_advance(10u);
+        for (i = 0; i < 4; i++) {
+            uint8_t now = (phys_level[i] > 0u) ? 1u : 0u;
+
+            if ((now != 0u) && (was_on[i] == 0u)) {
+                fronts_batch[i]++;
+            }
+            was_on[i] = now;
+        }
+    }
+
+    for (i = 0; i < 4; i++) {
+        uint16_t on = duty50 ? (uint16_t)(period[i] / 2u) : (uint16_t)100u;
+
+        CHECK_EQ(fronts_tick[i], expect[i]);
+        CHECK_EQ(fronts_batch[i], expect[i]);
+        CHECK_EQ(lit_tick[i], expect[i] * (unsigned)on);
+        /* Вспышки стартуют на 1-м тике и далее ровно через период:
+         * накопления ошибки от цикла к циклу нет. */
+        for (f = 0; f < 5u; f++) {
+            if (flash_at[i][f] != 0u) {
+                CHECK_EQ(flash_at[i][f], 1u + f * (unsigned)period[i]);
+            }
+        }
+    }
+}
+
+static void test_independent_rates(void)
+{
+    check_rates(false);   /* короткая вспышка 100 мс */
+    check_rates(true);    /* скважность 50 % (examples/rates_ch32v003) */
+}
+#endif /* LED_COUNT >= 4 */
+
 #if LED_USE_SEQUENCES
 static void test_sequence(void)
 {
@@ -1819,6 +1926,9 @@ int main(void)
     test_on_off_toggle();
     test_on_for_timing();
     test_blink();
+#if LED_COUNT >= 4
+    test_independent_rates();
+#endif
     test_levels();
 #if LED_USE_SEQUENCES
     test_sequence();

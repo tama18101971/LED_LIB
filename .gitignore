@@ -7,3 +7,4 @@ compile_commands.json
 *.swp
 .DS_Store
 __pycache__/
+.vscode/extensions.json

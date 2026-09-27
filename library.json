@@ -1,7 +1,7 @@
 {
     "name": "led-lib",
     "version": "3.0.0",
-    "description": "Bare-metal LED control library for 1..8 independent LEDs: event-driven time model (led_advance + led_ticks_until_next for sleeping hosts), dimmable output levels, 12 global effects, ownership arbitration, 32-bit packed commands (4 bytes per phase pair), optional module compilation (LED_USE_*), interrupt-safe mutators via LED_ENTER_CRITICAL. C99, no RTOS, no malloc, no libc, ~45 bytes RAM for a single channel, GPIO only via user callback.",
+    "description": "Bare-metal LED control library for 1..8 independent LEDs: event-driven time model (led_advance + led_ticks_until_next for sleeping hosts), dimmable output levels, 12 global effects, ownership arbitration, 32-bit packed commands (4 bytes per phase pair), optional module compilation (LED_USE_*), interrupt-safe mutators via LED_ENTER_CRITICAL. C99, no RTOS, no malloc, no libc, ~48 bytes RAM and ~1.2 KB Flash for a single-channel sleeping-host build (CH32V003, -Os), GPIO only via user callback.",
     "keywords": [
         "led",
         "blink",

@@ -13,12 +13,16 @@ packed commands (see CHANGELOG.md).
 - **Demo project**: `examples/test_ch32v003/` — CH32V003F4P6 (RISC-V 48MHz,
   2KB RAM, 16KB Flash) via PlatformIO + WCH NoneOS SDK. Sources only: no
   library copies, no own `platformio.ini`.
+- **Minimal example**: `examples/rates_ch32v003/` — four LEDs with different
+  blink rates at 50 % duty. Sources only, like the demo.
 
 ## Build
 
 ```bash
-pio run                     # build the demo (from repo ROOT)
-pio run -t upload           # flash via WCH-Link
+pio run                     # build all examples (from repo ROOT)
+pio run -e ch32v003         # demo only
+pio run -e ch32v003-rates   # four-rates example only
+pio run -t upload           # flash the selected environment via WCH-Link
 pio device monitor          # serial output (115200 baud)
 ```
 
@@ -36,14 +40,22 @@ plus a `-pedantic-errors` check and the CH32V003 firmware build.
 
 ## Layout rules
 
-- The root `platformio.ini` builds the demo: `src_dir =
-  examples/test_ch32v003/src`, library attached via `lib_deps = symlink://.`;
-  the demo must always compile the root library. No `src_filter` is needed —
-  the library uses the standard PlatformIO layout (`src/` is its source dir,
-  so `examples/` is never scanned).
+- The root `platformio.ini` builds **all** examples: `src_dir = examples`
+  plus a per-env `build_src_filter` that picks one example
+  (`ch32v003` → `test_ch32v003/src`, `ch32v003-rates` →
+  `rates_ch32v003/src`). `src_dir` is a project-level option and cannot be
+  set per env, hence the filter. The library is attached once via
+  `lib_deps = symlink://.`; every example must always compile the root
+  library. No `build.src_filter` is needed for the library itself — it uses
+  the standard PlatformIO layout (`src/` is its source dir, so
+  `examples/` is never scanned as library sources).
+- A new example = a new `examples/<name>/src/main.c` + a new env in the root
+  `platformio.ini` with a `build_src_filter` that includes it. Examples do
+  NOT get their own `platformio.ini` (that would be a second source of
+  truth and would drift).
 - Package contents are controlled by `export.exclude` in `library.json`
   (PlatformIO has no `.pioignore` mechanism).
-- Never copy `led.c`/`led.h` into `examples/` — the demo must always
+- Never copy `led.c`/`led.h` into `examples/` — examples must always
   compile the root library.
 - `include/` is the public API surface; internal types (e.g. `led_state_t`)
   live in `src/led.c`.
@@ -60,14 +72,35 @@ plus a `-pedantic-errors` check and the CH32V003 firmware build.
   next tick, otherwise the batched advance would show a stale level).
 - `led_ticks_until_next()` never returns 0; `LED_TICKS_FOREVER` = no timers.
   Both are public contract, guarded by defensive clamps in `led_advance()`.
+  `patterns_active()` is *defined as* `next_change_ticks() != LED_TICKS_FOREVER`
+  — do not re-introduce a second traversal, or the two answers can diverge.
 - `sync_outputs()` must stay at the **start** of `led_advance()`: the first
   full drive after `led_init()/led_set_callback()/led_refresh()` has to occupy
   the same position in the callback stream for any advance splitting.
 - Active effects tick one tick per `led_advance(1)` (`next_change_ticks()`
   returns 1) — their modular counters are not fast-forwarded on purpose
   (would require division in the hot path).
-- Per-LED counters are `uint16_t`, so a single fast-forward is clamped to
+- Per-LED timers are `uint16_t`, so a single fast-forward is clamped to
   `0xFFFE` ticks.
+
+## Economy rules (v3, flash is the scarcest resource)
+
+- **One timer per channel.** `leds[i].timer` is "ticks to the next output
+  change"; `0` means "no timed mode". `next_change_ticks()`, `idle_ticks()`
+  and `tick_one()` therefore need no switch on the mode — a mode switch in
+  these hot paths costs ~100 B of flash. Keep it that way.
+- `LED_M_PHASE` (BLINK phase) and `LED_M_LOOP` (SEQUENCE) live in the spare
+  bits of `mode`; there is no separate `flags` field. `led_get_mode()` must
+  mask them off with `LED_M_MODE`.
+- `led_init()` clears only `timer`/`level`/`mode` per channel: the rest are
+  mode-scoped parameters written by the mutator that selects the mode.
+- The packed FSM reads the executing word through `pc_cmd` and takes the
+  channels of the FIRST command's device mask once, in `packed_begin()` —
+  a per-LED call then detaches a channel for the rest of the pattern.
+- `led_packed_once()` is `led_packed_run()` over a one-word table
+  (`pc_one_word`); do not add a second code path.
+- The packed decoder uses shifts only: `pc_level()`/`pc_time()` decode both
+  phases from one expression, `duration = win << (2 * shift)`.
 
 ## Key conventions
 
@@ -132,15 +165,16 @@ Library contribution = build with the library minus the same build without it.
 
 | Configuration | Flash | RAM |
 |---------------|-------|-----|
-| 1 channel, packed commands only | 1464 B | 44 B |
-| 3 channels, packed commands only | 1796 B | 64 B |
-| 1 channel, sequences only | 968 B | 28 B |
-| 4 channels, everything on | 2988 B | 120 B |
-| Demo firmware total (SDK + library) | 4444 B | 412 B |
+| 1 channel, packed commands only | 1244 B | 48 B |
+| 3 channels, packed commands only | 1532 B | 68 B |
+| 1 channel, plan subset (+sequences, +events) | 1620 B | 60 B |
+| 1 channel, sequences only | 792 B | 28 B |
+| 4 channels, everything on | 2660 B | 124 B |
+| Demo firmware total (SDK + library) | 4116 B | 412 B |
 
-Derived: core ≈ 736 B, packed-command module ≈ 728 B, sequences module
-≈ 232 B. Per-channel state: 20 B with sequences, 10 B without; packed
-FSM state: 22 B regardless of LED_COUNT.
+Derived: core ≈ 660 B, packed-command module ≈ 580 B, sequences module
+≈ 130 B. Per-channel state: 10 B without sequences, 20 B with; packed
+FSM state: 21 B regardless of LED_COUNT.
 
 Keep these numbers in check when touching the core; measure with `pio run` +
 `riscv-wch-elf-nm` (or a paired "with/without library" build, which is the only
