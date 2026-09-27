@@ -124,6 +124,15 @@ plus a `-pedantic-errors` check and the CH32V003 firmware build.
 
 ## Key conventions
 
+- The demo env builds **without diagnostics**: `build_flags` of
+  `[env:ch32v003]` carries `-DDEMO_UART=0 -DDEMO_SELFTEST=0`, and the same
+  defaults sit in `examples/test_ch32v003/src/main.c` so a build outside
+  PlatformIO is clean too. Result: 3968 B Flash / 412 B RAM and no
+  printf/putchar/malloc symbol at all in `firmware.elf` (11520 B / 976 B
+  with both diagnostics on). Do not override these through
+  `PLATFORMIO_BUILD_FLAGS` — PlatformIO concatenates it with `build_flags`
+  and you get `warning: "DEMO_UART" redefined`; flip the flags in
+  `platformio.ini` instead.
 - `led_set_fn` callback is the only GPIO interface — never write GPIO
   directly from led.c. Signature is `(uint8_t id, uint8_t level)`; levels are
   0..LED_LEVEL_MAX and are passed through unvalidated. Callback must not call
