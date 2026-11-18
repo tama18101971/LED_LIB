@@ -728,7 +728,7 @@ static void test_advance_invariant(void)
     }
 }
 
-/** R1: ноль тиков — полный no-op. */
+/** R1: ноль тиков не двигает FSM, но обслуживает sync и ownership. */
 static void test_advance_zero(void)
 {
     unsigned before;
@@ -739,6 +739,14 @@ static void test_advance_zero(void)
     before = log_len;
     led_advance(0);
     CHECK_EQ(log_len, before);
+
+    reset_mock();
+    before = log_len;
+    led_advance(0);
+    CHECK_EQ(log_len - before, LED_COUNT);
+    led_set_owner(LED_OWNER_STROBE);
+    led_advance(0);
+    CHECK_EQ(led_claim(), LED_OWNER_NONE);
 }
 
 /**
@@ -1303,6 +1311,11 @@ static void test_effect_timer(void)
     CHECK_EQ(led_effect_remaining(), 100u * TEST_EFFECT_PERIOD - 23u);
     led_restart_effect_for(TEST_EFFECT, 100);
     CHECK_EQ(led_effect_remaining(), 100u * TEST_EFFECT_PERIOD);
+
+    /* Инициализация делает эффект неактивным и сбрасывает его запросы. */
+    led_init();
+    CHECK_EQ(led_effect_active(), 0);
+    CHECK_EQ(led_effect_remaining(), 0);
 }
 #endif /* TEST_EFFECT != LED_EFFECT_NONE */
 
@@ -1410,6 +1423,7 @@ static void test_packed_format(void)
 
     /* Вне диапазона — clamp к максимуму; 0 — «фаза без ожидания». */
     CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, 5000000u, 0u, 1u, 1u)), 1032192u);
+    CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, UINT32_MAX, 0u, 1u, 1u)), 1032192u);
     CHECK_EQ(LED_CMD_T0(LED_CMD(1u, 1u, 0u, 0u, 1u, 1u)), 0);
     CHECK_EQ(LED_CMD_T1(LED_CMD(1u, 1u, 1u, 0u, 1u, 1u)), 0);
 
@@ -1740,7 +1754,7 @@ static void test_owner(void)
 #if LED_USE_EVENTS
 static unsigned ev_cycle, ev_end, ev_state;
 static uint32_t ev_arg;
-static uint8_t  ev_id;
+static uint8_t  ev_id, ev_cycle_id, ev_end_id;
 
 static void mock_event(uint8_t id, led_event_t ev, uint32_t arg)
 {
@@ -1748,8 +1762,10 @@ static void mock_event(uint8_t id, led_event_t ev, uint32_t arg)
     ev_arg = arg;
     if (ev == LED_EV_CYCLE_START) {
         ev_cycle++;
+        ev_cycle_id = id;
     } else if (ev == LED_EV_PATTERN_END) {
         ev_end++;
+        ev_end_id = id;
     } else if (id == 0) {
         /* События уровня считаем только для канала 0: первый advance
          * «дописал» бы состояния остальных каналов (led_init сбросил
@@ -1765,6 +1781,8 @@ static void ev_reset(void)
     ev_state = 0;
     ev_arg   = 0;
     ev_id    = 0;
+    ev_cycle_id = 0;
+    ev_end_id = 0;
     led_set_event_callback(mock_event);
 }
 
@@ -1815,6 +1833,30 @@ static void test_events(void)
     run(30);
     CHECK_EQ(ev_end, 1);
     CHECK_EQ(ev_id, 0);
+
+    /* Один сохранённый ID — на старте и завершении packed-паттерна. */
+    {
+        uint8_t id = (LED_COUNT > 1u) ? 1u : 0u;
+        uint8_t dev = (uint8_t)(1u << id);
+        uint32_t cmd;
+
+#if LED_COUNT >= 4
+        dev = (uint8_t)(dev | 0x08u);
+#endif
+        cmd = LED_CMD(dev, 1u, 10u, 10u, 1u, 0u);
+        reset_mock();
+        ev_reset();
+        led_set_owner(LED_OWNER_BEACON);
+        led_packed_run(&cmd, 1u);
+        CHECK_EQ(ev_cycle_id, id);
+        led_set_level(id, 0u);
+#if LED_COUNT >= 4
+        led_set_level(3u, 0u);
+#endif
+        CHECK_EQ(led_stop_owner(LED_OWNER_BEACON), 1);
+        CHECK_EQ(ev_end, 1);
+        CHECK_EQ(ev_end_id, id);
+    }
 #endif
 
 #if LED_USE_EFFECTS && (TEST_EFFECT != LED_EFFECT_NONE)
@@ -1834,6 +1876,23 @@ static void test_events(void)
     CHECK_EQ(ev_state, 1);
     CHECK_EQ(ev_arg, 6u);
     CHECK_EQ(ev_id, 0);
+
+    /* Без аппаратного callback событие состояния не отправляется. */
+    reset_mock();
+    ev_reset();
+    led_set_callback(NULL);
+    led_set_level(0, 6u);
+    CHECK_EQ(ev_state, 0);
+
+    /* Refresh повторно пишет уровень и повторно сообщает событие. */
+    reset_mock();
+    ev_reset();
+    led_set_callback(mock_gpio);
+    led_set_level(0, 6u);
+    CHECK_EQ(ev_state, 1);
+    led_refresh();
+    led_advance(0u);
+    CHECK_EQ(ev_state, 2);
 
     /* Снятие callback'а. */
     led_set_event_callback(NULL);

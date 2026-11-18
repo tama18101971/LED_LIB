@@ -31,6 +31,10 @@ jobs:
             name: led3
           - config: '-DLED_COUNT=5'
             name: led5
+          - config: '-DLED_COUNT=6'
+            name: led6
+          - config: '-DLED_COUNT=7'
+            name: led7
           - config: '-DLED_COUNT=8'
             name: led8
           - config: '-DLED_USE_EFFECTS=0'
