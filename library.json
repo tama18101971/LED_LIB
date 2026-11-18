@@ -39,6 +39,7 @@
         "exclude": [
             "AGENTS.md",
             ".gitignore",
+            ".kilo",
             ".github",
             ".vscode",
             "docs",
