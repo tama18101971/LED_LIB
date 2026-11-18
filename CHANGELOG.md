@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.2] - 2026-11-18
+
+### Fixed
+
+- `LED_TIME_ENC()` корректно насыщает очень большие значения, не переполняя
+  промежуточное округление.
+- ID событий packed-паттерна остаётся постоянным от первого цикла до остановки,
+  даже если все его каналы отсоединены.
+- `led_packed_once()` обновляет однословную команду и запускает FSM в одной
+  критической секции; getters времени и остатка эффекта защищены при ISR-модели.
+- `led_effect_remaining()` возвращает 0 после `led_init()`.
+
+### Changed
+
+- Обновлены размеры прошивок по актуальной сборке: demo — 3944 B Flash / 412 B
+  RAM, rates — 3348 B Flash / 408 B RAM.
+- Сравнение объектного кода `-Os` по 24 конфигурациям: сумма `text + data`
+  не выросла (от 0 до 128 B меньше). Это объектные размеры; полный размер
+  firmware зависит от линковки и окружения.
+
 ## [3.0.1] - 2026-09-28
 
 Проход по размеру кода на CH32V003 (-Os RV32EC). Сигнатуры API и ABI

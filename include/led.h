@@ -180,9 +180,9 @@ extern "C" {
 
 #define LED_LIB_VERSION_MAJOR 3
 #define LED_LIB_VERSION_MINOR 0
-#define LED_LIB_VERSION_PATCH 1
+#define LED_LIB_VERSION_PATCH 2
 
-/** Числовая версия для сравнений: 3.0.1 → 30001. */
+/** Числовая версия для сравнений: 3.0.2 → 30002. */
 #define LED_LIB_VERSION ((LED_LIB_VERSION_MAJOR * 10000) + \
                          (LED_LIB_VERSION_MINOR * 100) +   \
                          (LED_LIB_VERSION_PATCH))
